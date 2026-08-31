@@ -13,29 +13,42 @@ load_dotenv(ROOT / ".env")
 DEFAULT_DIR = ROOT / "csv" / "default"
 LOCAL_DIR = ROOT / "csv" / "local"
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-FAIXAS_LIMITE_LEGADAS = """score_minimo,score_maximo,limite_maximo
+POLITICAS_LIMITE_ANTERIORES = {
+    """score_minimo,score_maximo,limite_maximo
 0,299,1000.00
 300,499,2500.00
 500,699,5000.00
 700,849,10000.00
 850,1000,20000.00
-"""
+""",
+    """score_minimo,score_maximo,limite_maximo
+0,299,1000.00
+300,499,2500.00
+500,699,5000.00
+700,749,10000.00
+750,849,15000.00
+850,1000,20000.00
+""",
+}
+
+
+def migrar_faixas_limite(caminho_padrao: Path, caminho_local: Path) -> None:
+    try:
+        politica_local = caminho_local.read_text(encoding="utf-8")
+        if politica_local in POLITICAS_LIMITE_ANTERIORES:
+            shutil.copy2(caminho_padrao, caminho_local)
+    except (OSError, UnicodeDecodeError):
+        logger.warning("Não foi possível verificar a política local de crédito")
+
 
 for arquivo in DEFAULT_DIR.iterdir():
     destino = LOCAL_DIR / arquivo.name
     if not destino.exists():
         shutil.copy2(arquivo, destino)
 
-faixas_locais = LOCAL_DIR / "score_limite.csv"
-try:
-    usa_faixas_legadas = (
-        faixas_locais.read_text(encoding="utf-8") == FAIXAS_LIMITE_LEGADAS
-    )
-except (OSError, UnicodeDecodeError):
-    logger.warning("Não foi possível verificar a política local de crédito")
-    usa_faixas_legadas = False
-if usa_faixas_legadas:
-    shutil.copy2(DEFAULT_DIR / "score_limite.csv", faixas_locais)
+migrar_faixas_limite(
+    DEFAULT_DIR / "score_limite.csv", LOCAL_DIR / "score_limite.csv"
+)
 
 from .credito.agent import agente_credito
 from .credito.tools.credito import (

@@ -530,6 +530,7 @@ def solicitar_aumento_limite(
             "sucesso": True,
             "tipo": "aumento_limite",
             "status": status,
+            "score_atual": score,
             "limite_atual": _formatar_decimal(limite_atual),
             "novo_limite_solicitado": _formatar_decimal(novo_limite),
             "limite_maximo_score": _formatar_decimal(limite_maximo),

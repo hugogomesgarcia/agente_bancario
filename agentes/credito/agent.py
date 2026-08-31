@@ -139,17 +139,20 @@ def _resposta_do_resultado(resultado: dict, *, apos_entrevista: bool = False) ->
             f"{limite_atual} para {novo_limite}. Posso ajudar com outro assunto? "
             "Se preferir, diga que deseja encerrar."
         )
+    score_atual = resultado["score_atual"]
+    limite_maximo = _formatar_moeda(resultado["limite_maximo_score"])
     if apos_entrevista:
         return (
-            f"Após a atualização do score, sua solicitação do novo limite de "
-            f"{novo_limite} continua incompatível com a faixa permitida e foi "
-            "rejeitada. Posso ajudar com outro assunto ou encerrar."
+            f"Após a atualização, seu score é {score_atual} e permite um limite "
+            f"total de até {limite_maximo}. Por isso, sua solicitação de "
+            f"{novo_limite} foi rejeitada. Posso ajudar com outro assunto ou "
+            "encerrar."
         )
     return (
-        f"Sua solicitação do novo limite de {novo_limite} foi rejeitada porque "
-        "o valor não é compatível com seu score atual. Posso realizar uma "
-        "entrevista de crédito para tentar reajustar esse score. Você deseja "
-        "continuar com a entrevista?"
+        f"Seu score atual é {score_atual} e permite um limite total de até "
+        f"{limite_maximo}. Por isso, sua solicitação de {novo_limite} foi "
+        "rejeitada. Posso realizar uma entrevista de crédito para tentar "
+        "reajustar esse score. Você deseja continuar com a entrevista?"
     )
 
 

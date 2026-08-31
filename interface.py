@@ -42,9 +42,32 @@ if (historico) {
         historico.dataset.acompanharRolagem = 'true';
         historico.addEventListener('scroll', atualizarAcompanhamento);
     }
-    if (historico.dataset.acompanharRolagem !== 'false') {
-        historico.scrollTop = historico.scrollHeight;
+
+    const agendarRolagem = () => {
+        if (
+            historico.dataset.acompanharRolagem === 'false' ||
+            historico.rolagemPendente
+        ) {
+            return;
+        }
+        historico.rolagemPendente = true;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            historico.rolagemPendente = false;
+            if (historico.dataset.acompanharRolagem !== 'false') {
+                historico.scrollTop = historico.scrollHeight;
+            }
+        }));
+    };
+
+    historico.observadorRolagem?.disconnect();
+    const conteudo = historico.querySelector(
+        ':scope > [data-testid="stVerticalBlock"]'
+    );
+    if (conteudo) {
+        historico.observadorRolagem = new ResizeObserver(agendarRolagem);
+        historico.observadorRolagem.observe(conteudo);
     }
+    agendarRolagem();
 }
 </script>
 """

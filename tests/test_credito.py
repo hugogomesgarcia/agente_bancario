@@ -20,7 +20,7 @@ from agentes.credito.agent import (
     restringir_resposta_livre,
 )
 from agentes.credito.tools import credito
-from agentes.agent import root_agent
+from agentes.agent import migrar_faixas_limite, root_agent
 from agentes.compartilhado.estado import OPCOES_RESPOSTA
 from agentes.compartilhado.encerramento import solicitar_confirmacao_encerramento
 from agentes.entrevista_credito.tools import entrevista_credito
@@ -165,6 +165,8 @@ class FerramentasCreditoTest(unittest.TestCase):
         )
 
         self.assertEqual(resultado["status"], "aprovado")
+        self.assertEqual(resultado["score_atual"], 780)
+        self.assertEqual(resultado["limite_maximo_score"], "15000.00")
         cliente = self._linhas(self.clientes)[0]
         self.assertEqual(cliente["Limite de Crédito"], "15000.00")
         solicitacao = self._linhas(self.solicitacoes)[0]
@@ -179,6 +181,8 @@ class FerramentasCreditoTest(unittest.TestCase):
         )
 
         self.assertEqual(resultado["status"], "rejeitado")
+        self.assertEqual(resultado["score_atual"], 780)
+        self.assertEqual(resultado["limite_maximo_score"], "15000.00")
         self.assertEqual(
             self._linhas(self.clientes)[0]["Limite de Crédito"], "5000.00"
         )
@@ -195,6 +199,30 @@ class FerramentasCreditoTest(unittest.TestCase):
             ],
             "15000.01",
         )
+
+    def test_perfil_de_referencia_aprova_limite_de_treze_mil(self):
+        score = entrevista_credito.calcular_score_credito(
+            "12000", "formal", "2000", 0, False
+        )
+        self.assertEqual(score, 680)
+        self.clientes.write_text(
+            'CPF,"Data de Nascimento",Score,"Limite de Crédito"\n'
+            f'"710.483.880-50","29/07/1997",{score},5000.00\n',
+            encoding="utf-8",
+        )
+        faixas_padrao = (
+            Path(__file__).resolve().parents[1]
+            / "csv"
+            / "default"
+            / "score_limite.csv"
+        )
+
+        with patch.object(credito, "SCORE_LIMITE_CSV", faixas_padrao):
+            resultado = credito.solicitar_aumento_limite("13000", self.contexto)
+
+        self.assertEqual(resultado["status"], "aprovado")
+        self.assertEqual(resultado["score_atual"], 680)
+        self.assertEqual(resultado["limite_maximo_score"], "15000.00")
 
     def test_valor_invalido_ou_sem_aumento_nao_e_registrado(self):
         for valor, erro in (
@@ -326,6 +354,90 @@ class FerramentasCreditoTest(unittest.TestCase):
         self.assertEqual(cliente["Data de Nascimento"], "29/07/1997")
         self.assertEqual(cliente["Score"], "720")
         self.assertEqual(cliente["Limite de Crédito"], "5000.00")
+
+
+class PoliticaLimitePadraoTest(unittest.TestCase):
+    FAIXAS = (
+        (0, 299, "1000.00"),
+        (300, 399, "2500.00"),
+        (400, 499, "5000.00"),
+        (500, 549, "7500.00"),
+        (550, 574, "10000.00"),
+        (575, 599, "11000.00"),
+        (600, 624, "12000.00"),
+        (625, 649, "13000.00"),
+        (650, 674, "14000.00"),
+        (675, 699, "15000.00"),
+        (700, 724, "16000.00"),
+        (725, 749, "17000.00"),
+        (750, 774, "18000.00"),
+        (775, 799, "19000.00"),
+        (800, 1000, "20000.00"),
+    )
+
+    def setUp(self):
+        self.faixas_padrao = (
+            Path(__file__).resolve().parents[1]
+            / "csv"
+            / "default"
+            / "score_limite.csv"
+        )
+
+    def test_limites_inferior_e_superior_de_todas_as_faixas(self):
+        with patch.object(credito, "SCORE_LIMITE_CSV", self.faixas_padrao):
+            for minimo, maximo, limite in self.FAIXAS:
+                for score in (minimo, maximo):
+                    with self.subTest(score=score):
+                        self.assertEqual(
+                            credito._limite_permitido(score), Decimal(limite)
+                        )
+
+    def test_perfis_representativos_usam_formula_inalterada(self):
+        casos = (
+            (("12000", "formal", "2000", 0, False), 680, "15000.00"),
+            (("12000", "formal", "2000", 0, True), 480, "5000.00"),
+            (("12000", "formal", "2000", 2, False), 640, "13000.00"),
+            (("12000", "formal", "2000", 3, False), 610, "12000.00"),
+            (("12000", "formal", "11000", 0, False), 533, "7500.00"),
+        )
+        with patch.object(credito, "SCORE_LIMITE_CSV", self.faixas_padrao):
+            for argumentos, score_esperado, limite_esperado in casos:
+                with self.subTest(argumentos=argumentos):
+                    score = entrevista_credito.calcular_score_credito(*argumentos)
+                    self.assertEqual(score, score_esperado)
+                    self.assertEqual(
+                        credito._limite_permitido(score), Decimal(limite_esperado)
+                    )
+
+    def test_migracao_substitui_politica_anterior_e_preserva_customizada(self):
+        with tempfile.TemporaryDirectory() as diretorio:
+            raiz = Path(diretorio)
+            padrao = raiz / "padrao.csv"
+            local = raiz / "local.csv"
+            nova_politica = self.faixas_padrao.read_text(encoding="utf-8")
+            padrao.write_text(nova_politica, encoding="utf-8")
+            local.write_text(
+                "score_minimo,score_maximo,limite_maximo\n"
+                "0,299,1000.00\n"
+                "300,499,2500.00\n"
+                "500,699,5000.00\n"
+                "700,749,10000.00\n"
+                "750,849,15000.00\n"
+                "850,1000,20000.00\n",
+                encoding="utf-8",
+            )
+
+            migrar_faixas_limite(padrao, local)
+            self.assertEqual(local.read_text(encoding="utf-8"), nova_politica)
+
+            politica_customizada = (
+                "score_minimo,score_maximo,limite_maximo\n0,1000,9999.00\n"
+            )
+            local.write_text(politica_customizada, encoding="utf-8")
+            migrar_faixas_limite(padrao, local)
+            self.assertEqual(
+                local.read_text(encoding="utf-8"), politica_customizada
+            )
 
 
 class FluxoCreditoTest(unittest.TestCase):
@@ -561,8 +673,10 @@ class FluxoCreditoTest(unittest.TestCase):
             "sucesso": True,
             "tipo": "aumento_limite",
             "status": "rejeitado",
+            "score_atual": 780,
             "limite_atual": "9000.00",
             "novo_limite_solicitado": "20000.00",
+            "limite_maximo_score": "18000.00",
         }
 
         with patch(
@@ -583,8 +697,10 @@ class FluxoCreditoTest(unittest.TestCase):
             "sucesso": True,
             "tipo": "aumento_limite",
             "status": "rejeitado",
+            "score_atual": 599,
             "limite_atual": "5000.00",
             "novo_limite_solicitado": "12000.00",
+            "limite_maximo_score": "11000.00",
         }
 
         resposta = interceptar_fluxo_credito(
@@ -741,7 +857,7 @@ class FluxoCreditoTest(unittest.TestCase):
         contexto.state.update(
             {
                 entrevista_credito.RETORNO_ENTREVISTA: {
-                    "score_atualizado": 700
+                    "score_atualizado": 599
                 },
                 credito.PENDENCIA_REANALISE: {
                     "novo_limite_solicitado": "12000.00"
@@ -752,8 +868,10 @@ class FluxoCreditoTest(unittest.TestCase):
             "sucesso": True,
             "tipo": "aumento_limite",
             "status": "rejeitado",
+            "score_atual": 599,
             "limite_atual": "5000.00",
             "novo_limite_solicitado": "12000.00",
+            "limite_maximo_score": "11000.00",
         }
 
         with patch(
@@ -765,7 +883,8 @@ class FluxoCreditoTest(unittest.TestCase):
             )
 
         texto = resposta.content.parts[0].text
-        self.assertIn("continua incompatível", texto)
+        self.assertIn("score é 599", texto)
+        self.assertIn("R$ 11.000,00", texto)
         self.assertNotIn("Você deseja continuar com a entrevista", texto)
         self.assertEqual(
             contexto.state[credito.ETAPA_CREDITO],
