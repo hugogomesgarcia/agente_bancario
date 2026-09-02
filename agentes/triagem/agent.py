@@ -13,6 +13,7 @@ from agentes.compartilhado.encerramento import (
     solicitar_confirmacao_encerramento,
     tratar_confirmacao_encerramento,
 )
+from agentes.compartilhado.transferencia import transferir_silenciosamente
 from agentes.compartilhado.valores import normalizar_valor_monetario
 from agentes.credito.tools.credito import AGUARDANDO_PROXIMA_ACAO, ETAPA_CREDITO
 from . import guardrail
@@ -138,8 +139,7 @@ def _transferir_para_especialista_se_aplicavel(
         callback_context.state.get(ETAPA_CREDITO) == AGUARDANDO_PROXIMA_ACAO
         and normalizar_valor_monetario(mensagem_usuario) is not None
     ):
-        callback_context.actions.transfer_to_agent = "credito"
-        return _resposta("")
+        return transferir_silenciosamente(callback_context, "credito")
     return None
 
 

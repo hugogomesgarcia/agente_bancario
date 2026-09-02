@@ -15,6 +15,11 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from agentes.credito.agent import (
+    _solicitou_aumento_limite,
+    _solicitou_aumento_sem_valor,
+    _solicitou_consulta_limite,
+    _solicitou_consulta_score,
+    _solicitou_entrevista_credito,
     agente_credito,
     interceptar_fluxo_credito,
     restringir_resposta_livre,
@@ -438,6 +443,38 @@ class PoliticaLimitePadraoTest(unittest.TestCase):
             self.assertEqual(
                 local.read_text(encoding="utf-8"), politica_customizada
             )
+
+
+class IntencoesCreditoTest(unittest.TestCase):
+    def test_distingue_consulta_de_pedido_para_melhorar_score(self):
+        self.assertTrue(_solicitou_consulta_score("Qual é meu score?"))
+        self.assertFalse(_solicitou_consulta_score("Quero aumentar meu score"))
+        self.assertTrue(_solicitou_entrevista_credito("Quero aumentar meu score"))
+
+    def test_distingue_consulta_de_aumento_de_limite(self):
+        self.assertTrue(_solicitou_consulta_limite("Qual é meu limite atual?"))
+        self.assertFalse(_solicitou_consulta_limite("Quero um limite maior"))
+        self.assertTrue(_solicitou_aumento_limite("Quero um limite maior"))
+
+    def test_reconhece_sinonimos_e_respeita_negativa(self):
+        for mensagem in (
+            "Quero elevar meu limite",
+            "Pode ampliar meu limite?",
+            "Quero subir o limite",
+            "Preciso de mais limite",
+        ):
+            with self.subTest(mensagem=mensagem):
+                self.assertTrue(_solicitou_aumento_limite(mensagem))
+
+        self.assertFalse(_solicitou_aumento_limite("Não quero aumentar meu limite"))
+
+    def test_mil_e_k_contam_como_valor_informado(self):
+        self.assertFalse(
+            _solicitou_aumento_sem_valor("Quero aumentar meu limite para 9 mil")
+        )
+        self.assertFalse(
+            _solicitou_aumento_sem_valor("Quero aumentar meu limite para 12k")
+        )
 
 
 class FluxoCreditoTest(unittest.TestCase):

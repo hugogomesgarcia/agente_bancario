@@ -1,31 +1,33 @@
 import csv
 from contextlib import contextmanager
-import fcntl
 import os
 from pathlib import Path
 import tempfile
-from threading import Lock
+
+import portalocker
 
 
 class DadosCsvIndisponiveis(Exception):
     pass
 
 
-_LOCK_CSV = Lock()
+TEMPO_LIMITE_BLOQUEIO_CSV = 5
+INTERVALO_BLOQUEIO_CSV = 0.05
 
 
 @contextmanager
 def bloquear_csv(diretorio: Path):
     try:
         diretorio.mkdir(parents=True, exist_ok=True)
-        with (diretorio / ".credito.lock").open("a", encoding="utf-8") as lock:
-            with _LOCK_CSV:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    except OSError as erro:
+        with portalocker.Lock(
+            diretorio / ".credito.lock",
+            mode="a",
+            timeout=TEMPO_LIMITE_BLOQUEIO_CSV,
+            check_interval=INTERVALO_BLOQUEIO_CSV,
+            raise_on_release_error=True,
+        ):
+            yield
+    except (OSError, portalocker.exceptions.LockException) as erro:
         raise DadosCsvIndisponiveis from erro
 
 

@@ -50,6 +50,8 @@ migrar_faixas_limite(
     DEFAULT_DIR / "score_limite.csv", LOCAL_DIR / "score_limite.csv"
 )
 
+# Estes módulos fixam configuração e caminhos ao importar; carregue o ambiente e
+# materialize os CSVs locais antes de compor a árvore de agentes.
 from .credito.agent import agente_credito
 from .cambio.agent import agente_cambio
 from .credito.tools.credito import (

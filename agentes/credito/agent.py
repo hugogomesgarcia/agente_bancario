@@ -14,6 +14,7 @@ from agentes.compartilhado.encerramento import (
     solicitar_confirmacao_encerramento,
     tratar_confirmacao_encerramento,
 )
+from agentes.compartilhado.transferencia import transferir_silenciosamente
 from agentes.compartilhado.valores import normalizar_valor_monetario
 from .tools.credito import (
     AGUARDANDO_DECISAO_ENTREVISTA,
@@ -160,7 +161,9 @@ def _normalizar_resposta(texto: str) -> str:
     return re.sub(r"[^a-záàâãéêíóôõúç ]", "", texto.lower()).strip()
 
 
+# Atalhos locais cobrem apenas intenções explícitas; casos ambíguos seguem ao modelo.
 def _solicitou_consulta_score(texto: str) -> bool:
+    # "Qual é meu score?" consulta; "quero aumentar meu score" inicia entrevista.
     normalizado = _normalizar_resposta(texto)
     return bool(
         "score" in normalizado
@@ -176,6 +179,7 @@ def _solicitou_consulta_score(texto: str) -> bool:
 
 
 def _solicitou_consulta_limite(texto: str) -> bool:
+    # "Qual é meu limite?" consulta; "quero um limite maior" solicita aumento.
     normalizado = _normalizar_resposta(texto)
     return bool(
         "limite" in normalizado
@@ -193,6 +197,7 @@ def _solicitou_consulta_limite(texto: str) -> bool:
 
 
 def _solicitou_aumento_limite(texto: str) -> bool:
+    # Aceita "elevar/ampliar/subir o limite", mas não "não quero aumentar".
     normalizado = _normalizar_resposta(texto)
     if "score" in normalizado:
         return False
@@ -371,8 +376,9 @@ def interceptar_fluxo_credito(
         callback_context.state[ACAO_ENTREVISTA_CREDITO] = None
         if acao_entrevista == "aceita":
             callback_context.state[ETAPA_CREDITO] = None
-            callback_context.actions.transfer_to_agent = "entrevista_credito"
-            return _resposta("")
+            return transferir_silenciosamente(
+                callback_context, "entrevista_credito"
+            )
         if acao_entrevista == "recusada":
             callback_context.state[PENDENCIA_REANALISE] = None
             callback_context.state[ETAPA_CREDITO] = AGUARDANDO_PROXIMA_ACAO
@@ -411,8 +417,9 @@ def interceptar_fluxo_credito(
     ):
         if _aceitou_entrevista(texto) and not _recusou_entrevista(texto):
             callback_context.state[ETAPA_CREDITO] = None
-            callback_context.actions.transfer_to_agent = "entrevista_credito"
-            return _resposta("")
+            return transferir_silenciosamente(
+                callback_context, "entrevista_credito"
+            )
         if _recusou_entrevista(texto):
             callback_context.state[PENDENCIA_REANALISE] = None
             callback_context.state[ETAPA_CREDITO] = AGUARDANDO_PROXIMA_ACAO
@@ -422,8 +429,7 @@ def interceptar_fluxo_credito(
             if resposta_consulta is not None:
                 return resposta_consulta
             if _solicitou_assunto_sem_suporte(texto):
-                callback_context.actions.transfer_to_agent = "triagem"
-                return _resposta("")
+                return transferir_silenciosamente(callback_context, "triagem")
             if _solicitou_aumento_limite(texto):
                 callback_context.state[ETAPA_CREDITO] = AGUARDANDO_NOVO_LIMITE
                 llm_request.append_instructions(
@@ -447,16 +453,16 @@ def interceptar_fluxo_credito(
         return None
 
     if _solicitou_entrevista_credito(texto):
-        callback_context.actions.transfer_to_agent = "entrevista_credito"
-        return _resposta("")
+        return transferir_silenciosamente(
+            callback_context, "entrevista_credito"
+        )
 
     resposta_consulta = _responder_consulta_credito(callback_context, texto)
     if resposta_consulta is not None:
         return resposta_consulta
 
     if _solicitou_assunto_sem_suporte(texto):
-        callback_context.actions.transfer_to_agent = "triagem"
-        return _resposta("")
+        return transferir_silenciosamente(callback_context, "triagem")
 
     if _solicitou_aumento_sem_valor(texto):
         callback_context.state[ETAPA_CREDITO] = AGUARDANDO_NOVO_LIMITE

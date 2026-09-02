@@ -1,248 +1,387 @@
 # Banco Ágil
 
-## Visão Geral
+Atendimento bancário conversacional construído com Google ADK, Gemini e
+Streamlit. A aplicação autentica o cliente e conduz, em uma única conversa,
+fluxos de Crédito, Entrevista de Crédito e Câmbio.
 
-Aplicação de atendimento bancário conversacional construída com Google ADK,
-Gemini e Streamlit. O fluxo autentica o cliente, identifica sua necessidade e
-transfere o atendimento entre agentes especializados sem expor a troca na
-interface.
+## Executar no Windows
 
-## Escopo
+### 1. Instale o Python
 
-| Agente | Responsabilidade | Status |
-| --- | --- | --- |
-| Triagem | Autenticação por CPF e data de nascimento e roteamento | Implementado |
-| Crédito | Consulta de limite e score e análise de aumento | Implementado |
-| Entrevista de Crédito | Coleta financeira, recálculo de score e retorno ao Crédito | Implementado |
-| Câmbio | Interpretação de pares e consulta de moedas e criptomoedas | Implementado |
+Baixe o instalador em [Python para Windows](https://www.python.org/downloads/windows/).
+O projeto aceita Python 3.10 ou superior e foi validado com Python 3.14.
 
-## Funcionalidades
+Na primeira tela do instalador, marque **Add python.exe to PATH** antes de
+selecionar **Install Now**. Ao final da instalação, feche e abra novamente o
+terminal.
 
-- Autenticação por CPF e data de nascimento com limite de três falhas.
-- Confirmação explícita antes de encerrar uma conversa.
-- Encerramento disponível durante autenticação, Crédito, Entrevista ou Câmbio.
-- Transferências implícitas entre Triagem e os três agentes especialistas.
-- Consulta do limite e do score do cliente autenticado.
-- Solicitação de um novo limite total com validação monetária determinística.
-- Aprovação ou rejeição conforme as faixas de `score_limite.csv`.
-- Registro de cada análise em `solicitacoes_aumento_limite.csv`.
-- Entrevista estruturada sobre renda, emprego, despesas, dependentes e dívidas.
-- Persistência do novo score e reanálise automática de um pedido rejeitado.
-- Interpretação semântica de pares de moedas e criptomoedas em linguagem casual.
-- Destino BRL por padrão somente quando o cliente não expressa outra moeda.
-- Consulta de compra e venda em tempo real pela AwesomeAPI, com horário da fonte.
-- Conversão de quantidades entre moedas pelas taxas de compra e venda validadas.
-- Esclarecimento conversacional de pares incompletos ou ambíguos antes da consulta.
-- Respostas rápidas para escolhas fechadas na interface.
-- Exibição imediata da mensagem do cliente e indicador de digitação durante o processamento.
-- Isolamento das conversas em sessões mantidas somente em memória.
-- Fallbacks controlados para falhas de modelo e de armazenamento.
+### 2. Abra um terminal na pasta do projeto
 
-## Arquitetura
+Você pode usar PowerShell ou Prompt de Comando (CMD). No Explorador de Arquivos,
+abra a pasta do projeto, clique na barra de endereço, digite `powershell` ou
+`cmd` e pressione Enter.
 
-```text
-agentes/
-├── agent.py                    # inicialização e composição da árvore ADK
-├── compartilhado/              # estado, encerramento, moeda e acesso a CSV
-├── triagem/                    # autenticação, roteamento e guardrail de saída
-├── credito/                    # fluxo e ferramentas de crédito
-├── entrevista_credito/         # entrevista, cálculo e persistência do score
-└── cambio/                     # interpretação de pares e cliente AwesomeAPI
-aplicacao/
-└── servico_atendimento.py      # adaptação dos eventos do Runner
-csv/
-├── default/                    # dados fictícios usados como seed
-└── local/                      # dados mutáveis gerados em execução
-tests/                          # testes determinísticos e de integração ADK
-interface.py                    # interface Streamlit
+Se preferir clonar o repositório, instale o
+[Git para Windows](https://git-scm.com/download/win) e execute:
+
+```powershell
+git clone https://github.com/hugogomesgarcia/agente_bancario.git
+cd agente_bancario
 ```
 
-`agentes/agent.py` exporta `root_agent`, esperado pelo carregador do ADK. Na
-árvore de execução, Triagem é a raiz e Crédito, Entrevista de Crédito e Câmbio
-são seus subagentes.
+Confirme que o Python está disponível:
 
-`ServicoAtendimento` mantém a interface independente dos agentes concretos. Ele
-envia mensagens ao `Runner`, reúne apenas respostas finais, remove partes de
-raciocínio e reconhece o encerramento pelo sinal estruturado
-`event.actions.escalate`.
+```powershell
+py --version
+```
 
-Validações objetivas, cálculos e transições de estado são locais. O modelo é
-usado somente para classificação e interpretação de linguagem livre. Respostas
-livres da Triagem passam por uma revisão semântica separada antes de serem
-exibidas.
+Se `py` não for reconhecido, tente `python --version`. Se nenhum dos dois
+funcionar, reinstale o Python com a opção de adicionar ao `PATH` marcada.
 
-Em Câmbio, o Gemini interpreta a mensagem inteira e registra um par estruturado.
-Não há regex, lista de aliases ou associação local entre países e moedas sobre o
-texto do cliente. O modelo também formula a pergunta quando o par é ambíguo. O
-código local aplica BRL apenas quando a interpretação declara que nenhum destino
-foi expresso, valida os códigos e consulta
-`https://economia.awesomeapi.com.br/json/last/{par}`. Valores, horário e nome do
-par são aceitos somente da resposta validada da AwesomeAPI. Texto livre é
-preservado para explicações naturais de escopo e recusa de recomendações, mas o
-modelo é instruído a jamais informar uma cotação por conta própria. Quando a solicitação contém uma quantidade, o
-modelo fornece também o valor estruturado e sua evidência textual; a multiplicação
-pelas taxas de compra e venda permanece local.
+### 3. Crie o ambiente virtual e instale as dependências
 
-## Dados
+Os comandos abaixo chamam os executáveis da `.venv` diretamente. Não é
+necessário ativar o ambiente virtual, o que também evita problemas com a
+política de execução do PowerShell.
 
-Na primeira importação, os arquivos ausentes de `csv/default/` são copiados para
-`csv/local/`. Arquivos locais existentes não são sobrescritos, permitindo que o
-estado sobreviva a reinicializações da aplicação. A única exceção é a migração
-de políticas de limite anteriormente distribuídas pelo projeto: elas são
-atualizadas somente quando o conteúdo local ainda corresponde exatamente a uma
-versão conhecida, preservando tabelas customizadas.
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-As gravações de Crédito usam lock entre processos, arquivos temporários e um
-journal de recuperação para reduzir o risco de inconsistência entre o cadastro
-do cliente e o histórico de solicitações.
+### 4. Configure as chaves
 
-Os cadastros incluídos são fictícios. Um fluxo de demonstração pode usar:
+No PowerShell:
 
-- CPF: `710.483.880-50`
-- Data de nascimento: `29/07/1997`
-- Score inicial: `720`
-- Limite inicial: `R$ 5.000,00`
+```powershell
+Copy-Item .env-example .env
+notepad .env
+```
 
-Para esse cadastro, cujo score inicial é `720`, novos limites acima do atual e
-de até `R$ 16.000,00` são aprovados. `R$ 17.000,00` demonstra uma rejeição
-seguida da oferta de entrevista.
+No CMD:
 
-A política demonstrativa usa faixas menores a partir do limite de `R$ 10 mil`
-para evitar saltos grandes entre perfis próximos e mantém exposição máxima de
-`R$ 20 mil`:
+```bat
+copy .env-example .env
+notepad .env
+```
 
-| Score | Limite máximo |
-| --- | ---: |
-| 0–299 | R$ 1.000 |
-| 300–399 | R$ 2.500 |
-| 400–499 | R$ 5.000 |
-| 500–549 | R$ 7.500 |
-| 550–574 | R$ 10.000 |
-| 575–599 | R$ 11.000 |
-| 600–624 | R$ 12.000 |
-| 625–649 | R$ 13.000 |
-| 650–674 | R$ 14.000 |
-| 675–699 | R$ 15.000 |
-| 700–724 | R$ 16.000 |
-| 725–749 | R$ 17.000 |
-| 750–774 | R$ 18.000 |
-| 775–799 | R$ 19.000 |
-| 800–1000 | R$ 20.000 |
+Preencha o arquivo aberto pelo Bloco de Notas:
 
-Com renda de `R$ 12.000`, emprego formal, despesas de `R$ 2.000`, nenhum
-dependente e nenhuma dívida, a fórmula especificada produz score `680`. Nessa
-faixa, um novo limite total de `R$ 13.000` é aprovado e o teto é `R$ 15.000`.
+```dotenv
+GOOGLE_API_KEY=sua-chave-gemini
+GOOGLE_MODEL=gemini-3.5-flash-lite
+GOOGLE_GUARD_MODEL=gemini-3.5-flash-lite
+AWESOMEAPI_TOKEN=seu-token-awesomeapi
+```
 
-## Desafios Enfrentados
+A chave do Gemini pode ser criada no
+[Google AI Studio](https://aistudio.google.com/app/apikey). O token da API de
+cotações é descrito na
+[documentação da AwesomeAPI](https://docs.awesomeapi.com.br/api-de-moedas).
+`GOOGLE_GUARD_MODEL` é opcional; quando ausente, o revisor usa o valor de
+`GOOGLE_MODEL`.
 
-A fórmula fornecida combina a razão entre renda e despesas com emprego,
-dependentes e dívidas, mas não preserva a renda absoluta. Por isso, duas pessoas
-com rendas diferentes e a mesma proporção de despesas podem obter scores
-semelhantes. Sem alterar a fórmula, a política foi calibrada com perfis
-representativos, faixas menores e um teto conservador; os testes registram tanto
-o cenário esperado quanto os principais fatores de redução.
+### 5. Inicie a interface
 
-A evolução da política também precisava alcançar instalações existentes sem
-apagar ajustes deliberados. A inicialização migra apenas as versões anteriores
-reconhecidas por conteúdo exato e deixa qualquer outra tabela local intacta.
+```powershell
+.\.venv\Scripts\streamlit.exe run interface.py
+```
 
-Frases de câmbio casuais podem identificar ativos por país e ainda especificar
-outra moeda de destino, como "moeda da China em euro". Parsers por termos parciais
-podem reconhecer China e perder o destino. Por isso, toda a interpretação do par
-é feita em uma única chamada estruturada ao Gemini, incluindo trechos de evidência
-para as duas pontas; ambiguidades são devolvidas como perguntas, sem consultar a
-API ou adivinhar.
+O navegador deve abrir automaticamente. Se isso não acontecer, acesse
+[http://localhost:8501](http://localhost:8501). Para parar a aplicação, volte
+ao terminal e pressione `Ctrl+C`.
 
-O Streamlit executa o `Runner` de forma síncrona, e antes a mensagem recém-enviada
-só entrava no layout após a conclusão dessa chamada. O envio agora ocorre em duas
-execuções: a primeira persiste a mensagem pendente, e a segunda renderiza o balão
-do cliente e a animação de digitação antes de chamar o agente. Assim, operações de
-rede demoradas mantêm feedback visual sem mover o estado da sessão para uma thread.
+### 6. Execute os testes
 
-## Escolhas Técnicas
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
-A fórmula de score permanece isolada e inalterada. A conversão entre score e
-limite fica no CSV configurável, enquanto aprovação, persistência e mensagens
-são determinísticas. Em uma rejeição, a resposta informa o score utilizado e o
-teto da faixa, tornando a decisão auditável sem delegar valores financeiros ao
-modelo.
+Os testes automatizados usam diretórios temporários e não consomem chamadas
+reais do Gemini ou da AwesomeAPI.
 
-No chat, a rolagem automática acompanha o término do layout das novas mensagens
-e respostas rápidas. Se o cliente rolar o histórico para cima, a posição de
-leitura é preservada até que ele retorne ao final da conversa. Respostas rápidas
-continuam usando o mesmo caminho das mensagens digitadas; opções operacionais como
-`Nova cotação` apenas têm uma transição local explícita no agente de Câmbio. A
-identidade visual evita gradientes e efeitos decorativos em favor de cores
-sólidas, contraste alto e componentes discretos, preservando os elementos
-nativos e acessíveis do Streamlit.
+### 7. Reinicie os dados de demonstração
 
-A AwesomeAPI foi escolhida por oferecer cotações de compra e venda adequadas a
-pares com BRL e até 100 mil requisições mensais gratuitas sem cache mediante
-token. O token segue no cabeçalho `x-api-key`, nunca na URL, no estado da conversa
-ou em logs. A biblioteca padrão faz a chamada com timeout; pares disponíveis
-somente no sentido inverso são convertidos com `compra = 1 / venda_inversa` e
-`venda = 1 / compra_inversa`. Se não houver nenhum sentido direto, dois pares
-com BRL podem formar uma taxa cruzada preservando compra e venda. As duas formas
-derivadas e seus pares de referência são informados ao cliente.
+Pare a aplicação antes do reset. No PowerShell:
 
-## Tutorial de Execução e Testes
+```powershell
+Remove-Item -Recurse -Force csv\local
+```
 
-### Configuração
+No CMD:
 
-O projeto foi validado com Python 3.14.
+```bat
+rmdir /s /q csv\local
+```
+
+Na próxima inicialização, a aplicação recriará `csv/local/` a partir dos
+templates de `csv/default/`.
+
+## Executar no Linux
+
+Em Debian ou Ubuntu, instale o Python e as ferramentas do ambiente virtual:
 
 ```bash
-python -m venv .venv
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git
+```
+
+Na raiz do projeto:
+
+```bash
+python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp .env-example .env
 ```
 
-Configure a chave no arquivo `.env`:
-
-```dotenv
-GOOGLE_API_KEY=sua-chave
-GOOGLE_MODEL=gemini-3.5-flash-lite
-GOOGLE_GUARD_MODEL=gemini-3.5-flash-lite
-AWESOMEAPI_TOKEN=seu-token
-```
-
-`GOOGLE_GUARD_MODEL` é opcional. Quando ausente, o guardrail usa o mesmo modelo
-definido em `GOOGLE_MODEL`. O token gratuito da AwesomeAPI habilita dados em tempo
-real sem o cache de um minuto aplicado a requisições não autenticadas.
-
-### Execução
-
-Interface web:
+Edite `.env` com as mesmas variáveis mostradas na seção de Windows e inicie:
 
 ```bash
 .venv/bin/streamlit run interface.py
 ```
 
-Runner interativo do ADK:
-
-```bash
-.venv/bin/adk run agentes
-```
-
-### Testes
+Testes:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-A suíte usa CSVs temporários, respostas HTTP simuladas e modelos controlados
-para os testes de integração. Ela não requer chamadas reais ao Gemini nem à
-AwesomeAPI.
+Reset dos dados de demonstração, com a aplicação parada:
 
-## Limitações
+```bash
+rm -rf csv/local
+```
 
-- Cotações dependem da disponibilidade e dos pares oferecidos pela AwesomeAPI e
-  são referências informativas; o Banco Ágil não executa operações de câmbio.
-- O armazenamento em CSV é adequado ao escopo demonstrativo, mas não substitui
-  um banco transacional em produção.
-- As sessões da interface ficam somente em memória e são descartadas ao
-  reiniciar a aplicação.
-- O limite de tentativas de autenticação vale para a conversa em memória; um
-  novo atendimento inicia uma nova sessão.
-- Como a fórmula considera a razão entre renda e despesas, as faixas não
-  garantem proporcionalidade perfeita entre renda absoluta e limite disponível.
+## Execução Alternativa pelo ADK
+
+Para conversar com a árvore de agentes diretamente no terminal:
+
+Windows:
+
+```powershell
+.\.venv\Scripts\adk.exe run agentes
+```
+
+Linux:
+
+```bash
+.venv/bin/adk run agentes
+```
+
+## Visão Geral
+
+O Banco Ágil simula o atendimento de um banco digital fictício. A Triagem é a
+porta de entrada, autentica o cliente por CPF e data de nascimento e transfere a
+conversa para o especialista adequado sem expor a troca na interface.
+
+| Agente | Responsabilidade |
+| --- | --- |
+| Triagem | Autenticação, identificação do assunto, roteamento e encerramento |
+| Crédito | Consulta de score e limite e análise de aumento de limite |
+| Entrevista de Crédito | Coleta financeira, recálculo do score e retorno ao Crédito |
+| Câmbio | Interpretação de pares, cotação e conversão de moedas e criptomoedas |
+
+## Funcionalidades Implementadas
+
+- Autenticação por CPF e data de nascimento, com validação de CPF e limite de
+  três falhas por conversa.
+- Transferências implícitas entre a Triagem e os três especialistas.
+- Confirmação explícita antes de encerrar o atendimento.
+- Consulta determinística do score e do limite do cliente autenticado.
+- Solicitação de um novo limite total com normalização de valores monetários.
+- Aprovação ou rejeição baseada nas faixas configuráveis de
+  `score_limite.csv`.
+- Registro do histórico em `solicitacoes_aumento_limite.csv`.
+- Entrevista sobre renda, emprego, despesas, dependentes e dívidas.
+- Atualização do score e uma única reanálise automática do pedido rejeitado.
+- Cotação em tempo real pela AwesomeAPI, incluindo compra, venda e horário da
+  fonte.
+- Conversão de quantidades, pares inversos e taxas cruzadas por BRL.
+- Perguntas de esclarecimento antes da API quando o par é incompleto ou
+  ambíguo.
+- Respostas rápidas para escolhas fechadas e indicador visual de digitação.
+- Sessões isoladas por conversa na interface Streamlit.
+- Tratamento controlado de falhas de modelo, API e armazenamento.
+
+## Arquitetura
+
+```text
+interface.py
+└── aplicacao/servico_atendimento.py
+    └── Google ADK Runner
+        └── agentes/agent.py: root_agent (Triagem)
+            ├── agentes/credito/
+            ├── agentes/entrevista_credito/
+            └── agentes/cambio/
+
+agentes/compartilhado/       estado, encerramento, valores, locks e CSV
+csv/default/                 templates fictícios versionados
+csv/local/                   dados mutáveis de execução, ignorados pelo Git
+tests/                       testes unitários e integrações controladas
+```
+
+`agentes/agent.py` carrega o `.env`, prepara os dados locais e exporta
+`root_agent`, conforme esperado pelo carregador do Google ADK. A ordem de
+inicialização é intencional porque os módulos dos agentes fixam configurações e
+caminhos durante a importação.
+
+`ServicoAtendimento` isola a interface dos agentes concretos. Ele mantém uma
+sessão ADK em memória por conversa, envia mensagens ao `Runner`, reúne apenas as
+respostas finais, omite partes de raciocínio e reconhece o encerramento pelo
+sinal estruturado `event.actions.escalate`.
+
+### Fluxo de autenticação e triagem
+
+1. A interface envia uma mensagem interna para obter a saudação inicial.
+2. A Triagem coleta e valida o CPF localmente.
+3. A data de nascimento é comparada com `clientes.csv`.
+4. Após a autenticação, a intenção do cliente é encaminhada ao especialista.
+5. A interface continua exibindo todos os agentes como Banco Ágil.
+
+### Fluxo de crédito e entrevista
+
+1. Crédito consulta o perfil usando o CPF autenticado no estado da sessão.
+2. O novo limite total é comparado ao teto da faixa de score.
+3. Uma aprovação atualiza o cliente e registra a decisão no histórico.
+4. Uma rejeição preserva o pedido e oferece a entrevista financeira.
+5. A entrevista atualiza somente o score e retorna ao Crédito.
+6. O mesmo valor rejeitado é reanalisado exatamente uma vez.
+
+### Fluxo de câmbio
+
+1. O Gemini interpreta a mensagem inteira em uma estrutura com ativo de
+   origem, destino, quantidade e evidências textuais.
+2. Solicitações ambíguas geram uma pergunta sem chamada à API.
+3. O código valida os códigos e consulta a AwesomeAPI com o token em
+   `x-api-key`.
+4. Compra, venda, par e timestamp são validados antes da resposta.
+5. Pares inversos e taxas cruzadas por BRL são calculados localmente com
+   `Decimal`.
+
+## Dados CSV
+
+### `csv/default/`
+
+Esse diretório é a fonte versionada dos dados fictícios. Os arquivos funcionam
+como templates para uma instalação limpa:
+
+| Arquivo | Conteúdo |
+| --- | --- |
+| `clientes.csv` | CPF, data de nascimento, score e limite inicial |
+| `score_limite.csv` | Faixas de score e limite máximo permitido |
+| `solicitacoes_aumento_limite.csv` | Cabeçalho do histórico de solicitações |
+
+A aplicação não edita os arquivos de `csv/default/`. Assim, testes manuais e
+demonstrações podem alterar dados sem modificar o repositório ou os templates
+originais.
+
+### `csv/local/`
+
+Na primeira importação de `agentes/agent.py`, cada template ausente é copiado
+para `csv/local/`. A aplicação lê e grava somente essas cópias locais. Arquivos
+locais existentes não são sobrescritos, portanto alterações de score, limite e
+histórico sobrevivem a reinicializações.
+
+`csv/local/` é ignorado pelo Git. Para reiniciar um roteiro de demonstração ou
+teste manual, pare a aplicação e exclua o diretório conforme os comandos do
+início deste README. A próxima execução o recriará a partir de `csv/default/`.
+
+A suíte automatizada não depende desse reset: seus testes de escrita substituem
+os caminhos por CSVs temporários e não alteram os dados locais do usuário.
+
+As gravações são protegidas por um lock exclusivo multiplataforma fornecido por
+`portalocker`, com timeout controlado. Arquivos temporários e substituição
+atômica evitam conteúdo parcial. Aprovações que alteram `clientes.csv` e o
+histórico usam também um journal para recuperação se a segunda gravação falhar.
+
+### Cadastro de demonstração
+
+Um fluxo completo pode ser testado com dados fictícios já incluídos:
+
+| Campo | Valor |
+| --- | --- |
+| CPF | `710.483.880-50` |
+| Data de nascimento | `29/07/1997` |
+| Score inicial | `720` |
+| Limite inicial | `R$ 5.000,00` |
+
+Com esse perfil, um novo limite total de até `R$ 16.000,00` é permitido pela
+política inicial. Um pedido de `R$ 17.000,00` demonstra rejeição, oferta de
+entrevista e reanálise.
+
+## Desafios Enfrentados
+
+### Regras de crédito parcialmente especificadas
+
+A especificação exige uma comparação com `score_limite.csv`, mas não fornece o
+arquivo, suas colunas, faixas ou tetos. Também não define se o valor representa
+um incremento ou o novo limite total, nem se uma aprovação deve alterar o
+cadastro imediatamente. A implementação adotou uma política demonstrativa e
+configurável: o pedido representa o novo limite total, é aprovado até o teto da
+faixa e atualiza o cadastro quando aprovado.
+
+A fórmula de score também não define como converter resultados fracionários
+para o inteiro armazenado em `clientes.csv`. O cálculo usa `Decimal`, arredonda
+metade para cima somente ao final e limita o resultado ao intervalo de 0 a 1000.
+
+### Estado composto no Google ADK
+
+Mutações internas em um dicionário aninhado não geravam deltas persistidos pelo
+estado do ADK. A entrevista passou a copiar e reatribuir o rascunho completo a
+cada resposta. Um teste com `Runner` cobre os cinco turnos, a persistência, a
+transferência de volta e a reanálise.
+
+### Consistência entre arquivos CSV
+
+Uma aprovação precisa atualizar o cadastro e o histórico, mas CSV não oferece
+uma transação conjunta. O projeto combina lock entre processos, temporários,
+substituição atômica e journal durável. Se a segunda publicação falhar, o estado
+anterior pode ser restaurado no mesmo atendimento ou na próxima inicialização.
+
+### Ambiguidade em pedidos de câmbio
+
+Termos como “peso” podem representar várias moedas, e frases como “moeda da
+China em euro” possuem origem e destino expressos de maneiras diferentes.
+Tabelas locais de palavras parciais poderiam reconhecer apenas uma parte da
+mensagem. Por isso, uma única interpretação semântica considera a solicitação
+completa e fornece evidências; o código pergunta antes de consultar quando a
+interpretação não é segura.
+
+## Escolhas Técnicas
+
+### IA para linguagem, determinismo para operações
+
+O Gemini é usado onde há ambiguidade linguística: classificação de intenção,
+interpretação de respostas livres e identificação semântica de moedas. CPF,
+datas, cálculos financeiros, decisões de crédito, transições de estado,
+persistência e formatação de valores permanecem em código local. Essa divisão
+torna os fluxos críticos reproduzíveis e testáveis sem chamadas reais ao modelo.
+
+### Respostas baseadas em evidências
+
+Crédito e Câmbio não permitem que o modelo invente valores ou conclusões. Textos
+com score, limite, aprovação, rejeição, compra, venda ou conversão são montados
+localmente a partir dos CSVs ou de uma resposta validada da AwesomeAPI. Texto
+livre misturado a uma chamada de ferramenta é descartado.
+
+### Guardrail independente na Triagem
+
+Respostas livres da Triagem passam por um segundo Gemini, que compara o texto
+proposto com as ferramentas disponíveis e as evidências reais do turno. Uma
+reprovação permite uma única reescrita. Falha do revisor, JSON inválido ou uma
+segunda reprovação produzem uma resposta local segura, sem exibir conteúdo não
+revisado.
+
+### Portabilidade do armazenamento local
+
+`portalocker` abstrai o lock de arquivo entre Linux, macOS e Windows. O projeto
+mantém um lock por diretório para coordenar threads e processos que cooperam com
+o mesmo conjunto de CSVs, sem depender diretamente de `fcntl` ou de extensões
+específicas do Windows.
+
+### Interface desacoplada dos especialistas
+
+A interface injeta somente `root_agent` em `ServicoAtendimento`. Respostas
+rápidas são publicadas pelos agentes como metadados genéricos e retornam pelo
+mesmo caminho de uma mensagem digitada. Os handoffs e os nomes internos dos
+especialistas não vazam para o cliente.
