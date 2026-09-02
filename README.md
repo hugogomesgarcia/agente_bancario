@@ -205,25 +205,41 @@ conversa para o especialista adequado sem expor a troca na interface.
 
 ## Arquitetura
 
+Composição em execução:
+
 ```text
 interface.py
-└── aplicacao/servico_atendimento.py
+└── ServicoAtendimento
     └── Google ADK Runner
-        └── agentes/agent.py: root_agent (Triagem)
-            ├── agentes/credito/
-            ├── agentes/entrevista_credito/
-            └── agentes/cambio/
+        └── root_agent: Triagem
+            ├── Crédito
+            ├── Entrevista de Crédito
+            └── Câmbio
+```
 
-agentes/compartilhado/       estado, encerramento, valores, locks e CSV
+Estrutura principal de diretórios:
+
+```text
+aplicacao/
+└── servico_atendimento.py   integração genérica com o Runner
+agentes/
+├── agent.py                 inicialização e composição do root_agent
+├── triagem/
+├── credito/
+├── entrevista_credito/
+├── cambio/
+└── compartilhado/           estado, encerramento, valores, locks e CSV
 csv/default/                 templates fictícios versionados
 csv/local/                   dados mutáveis de execução, ignorados pelo Git
 tests/                       testes unitários e integrações controladas
 ```
 
 `agentes/agent.py` carrega o `.env`, prepara os dados locais e exporta
-`root_agent`, conforme esperado pelo carregador do Google ADK. A ordem de
-inicialização é intencional porque os módulos dos agentes fixam configurações e
-caminhos durante a importação.
+`root_agent`, um clone da Triagem que recebe Crédito, Entrevista de Crédito e
+Câmbio como `sub_agents`, conforme esperado pelo carregador do Google ADK. Os
+quatro agentes permanecem em pacotes irmãos no código. A ordem de inicialização
+é intencional porque seus módulos fixam configurações e caminhos durante a
+importação.
 
 `ServicoAtendimento` isola a interface dos agentes concretos. Ele mantém uma
 sessão ADK em memória por conversa, envia mensagens ao `Runner`, reúne apenas as
