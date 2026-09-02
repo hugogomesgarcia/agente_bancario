@@ -313,7 +313,6 @@ class FerramentasTriagemTest(unittest.TestCase):
 
         self.assertIsNone(resposta)
         self.assertIsNone(getattr(self.contexto.actions, "transfer_to_agent", None))
-        self.assertIsNone(self.contexto.state["classificacao_registrada"])
         self.assertEqual(
             self.contexto.state[CONTEXTO_GUARDRAIL], POS_AUTENTICACAO
         )
@@ -337,7 +336,6 @@ class FerramentasTriagemTest(unittest.TestCase):
         self.contexto.state.update(
             {
                 CONTEXTO_GUARDRAIL: POS_AUTENTICACAO,
-                "classificacao_registrada": "credito",
             }
         )
         candidata = LlmResponse(
@@ -516,38 +514,16 @@ class FerramentasTriagemTest(unittest.TestCase):
         resultado = consultar_client.consultar_cliente("71048388050", self.contexto)
         self.assertIn("erro", resultado)
 
-    def test_triagem_expoe_classificacao_e_tem_especialistas_como_subagentes(self):
+    def test_triagem_expoe_confirmacao_e_tem_especialistas_como_subagentes(self):
         ferramentas = asyncio.run(root_agent.canonical_tools())
         nomes = {ferramenta.name for ferramenta in ferramentas}
-        self.assertEqual(
-            nomes,
-            {"registrar_classificacao", "solicitar_confirmacao_encerramento"},
-        )
+        self.assertEqual(nomes, {"solicitar_confirmacao_encerramento"})
         self.assertEqual(
             [agente.name for agente in root_agent.sub_agents],
-            ["credito", "entrevista_credito"],
+            ["credito", "entrevista_credito", "cambio"],
         )
         for subagente in root_agent.sub_agents:
             self.assertIs(subagente.parent_agent, root_agent)
-
-    def test_registro_de_classificacao_preserva_semantica_de_placeholder(self):
-        resultado = consultar_client.registrar_classificacao("cambio", self.contexto)
-
-        self.assertTrue(resultado["registrado"])
-        self.assertFalse(resultado["encaminhamento_executado"])
-        self.assertEqual(self.contexto.state["classificacao_registrada"], "cambio")
-
-    def test_registro_de_classificacao_rejeita_destinos_nao_suportados(self):
-        for destino in ("credito", "entrevista_credito", "inexistente"):
-            with self.subTest(destino=destino):
-                self.contexto = ContextoDeTeste()
-                resultado = consultar_client.registrar_classificacao(
-                    destino, self.contexto
-                )
-
-                self.assertFalse(resultado["registrado"])
-                self.assertIn("erro", resultado)
-                self.assertNotIn("classificacao_registrada", self.contexto.state)
 
 
 if __name__ == "__main__":

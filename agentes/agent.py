@@ -51,6 +51,7 @@ migrar_faixas_limite(
 )
 
 from .credito.agent import agente_credito
+from .cambio.agent import agente_cambio
 from .credito.tools.credito import (
     migrar_base_clientes,
     recuperar_transacao_pendente,
@@ -63,5 +64,7 @@ migrar_base_clientes(DEFAULT_DIR / "clientes.csv", LOCAL_DIR / "clientes.csv")
 recuperar_transacao_pendente()
 
 root_agent = agente_triagem.clone(
-    update={"sub_agents": [agente_credito, agente_entrevista_credito]}
+    update={
+        "sub_agents": [agente_credito, agente_entrevista_credito, agente_cambio]
+    }
 )

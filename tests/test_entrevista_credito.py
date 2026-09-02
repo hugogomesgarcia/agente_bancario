@@ -38,14 +38,14 @@ from agentes.triagem.agent import agente_triagem
 class ModeloFluxoCompletoTeste(BaseLlm):
     async def generate_content_async(self, llm_request, stream=False):
         ferramentas = set(llm_request.tools_dict)
-        if "registrar_classificacao" in ferramentas:
-            chamada = types.FunctionCall(
-                name="transfer_to_agent", args={"agent_name": "credito"}
-            )
-        elif "solicitar_aumento_limite" in ferramentas:
+        if "solicitar_aumento_limite" in ferramentas:
             chamada = types.FunctionCall(
                 name="solicitar_aumento_limite",
                 args={"novo_limite_solicitado": "8000"},
+            )
+        elif "registrar_resposta_entrevista" not in ferramentas:
+            chamada = types.FunctionCall(
+                name="transfer_to_agent", args={"agent_name": "credito"}
             )
         else:
             raise AssertionError(f"Conjunto de ferramentas inesperado: {ferramentas}")
@@ -59,7 +59,7 @@ class ModeloFluxoCompletoTeste(BaseLlm):
 class ModeloEntrevistaDiretaTeste(BaseLlm):
     async def generate_content_async(self, llm_request, stream=False):
         ferramentas = set(llm_request.tools_dict)
-        if "registrar_classificacao" not in ferramentas:
+        if "registrar_resposta_entrevista" in ferramentas:
             raise AssertionError(f"Conjunto de ferramentas inesperado: {ferramentas}")
         chamada = types.FunctionCall(
             name="transfer_to_agent",

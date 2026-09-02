@@ -16,7 +16,7 @@ from google.adk.cli.utils.agent_loader import AgentLoader
 agente = AgentLoader(sys.argv[1]).load_agent("agentes")
 assert agente.name == "triagem"
 assert [subagente.name for subagente in agente.sub_agents] == [
-    "credito", "entrevista_credito"
+    "credito", "entrevista_credito", "cambio"
 ]
 assert all(subagente.parent_agent is agente for subagente in agente.sub_agents)
 """

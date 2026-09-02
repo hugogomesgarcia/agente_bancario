@@ -16,14 +16,25 @@ MENSAGEM_ERRO = (
 )
 CABECALHO_CHAT = """
 <header class="cabecalho-banco">
-    <div class="icone-banco" aria-hidden="true">
-        <svg viewBox="0 0 24 24">
-            <path d="M12 3 2 8v2h20V8L12 3Zm-6 9v6H3v3h18v-3h-3v-6h-2v6h-3v-6h-2v6H8v-6H6Z"/>
-        </svg>
+    <div class="marca-banco">
+        <div class="icone-banco" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+                <path d="M12 3 2 8v2h20V8L12 3Zm-6 9v6H3v3h18v-3h-3v-6h-2v6h-3v-6h-2v6H8v-6H6Z"/>
+            </svg>
+        </div>
+        <div>
+            <p class="nome-instituicao">Banco Ágil</p>
+            <h1>Atendimento digital</h1>
+        </div>
     </div>
-    <div>
-        <h1>Banco Ágil</h1>
-        <p><span class="status-online"></span>Atendimento online</p>
+    <div class="seguranca-atendimento">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M17 8h-1V6a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 0 1 4 0v2h-4V6Zm7 13H7v-9h10v9Z"/>
+        </svg>
+        <div>
+            <strong>Ambiente seguro</strong>
+            <span><i class="status-online"></i>Atendimento online</span>
+        </div>
     </div>
 </header>
 """
@@ -60,16 +71,19 @@ if (historico) {
     };
 
     historico.observadorRolagem?.disconnect();
-    const conteudo = historico.querySelector(
-        ':scope > [data-testid="stVerticalBlock"]'
-    );
-    if (conteudo) {
-        historico.observadorRolagem = new ResizeObserver(agendarRolagem);
-        historico.observadorRolagem.observe(conteudo);
-    }
+    historico.observadorRolagem = new MutationObserver(agendarRolagem);
+    historico.observadorRolagem.observe(historico, {
+        childList: true,
+        subtree: true,
+    });
     agendarRolagem();
 }
 </script>
+"""
+INDICADOR_DIGITACAO = """
+<div class="indicador-digitacao" role="status" aria-label="Banco Ágil está digitando">
+    <span></span><span></span><span></span>
+</div>
 """
 
 
@@ -94,10 +108,17 @@ def _selecionar_opcao(indice_mensagem: int, opcao: str) -> None:
     st.session_state.resposta_rapida_selecionada = opcao
 
 
+def _agendar_mensagem(texto: str) -> None:
+    st.session_state.mensagens.append({"autor": "cliente", "texto": texto})
+    st.session_state.mensagem_pendente = texto
+
+
 def _iniciar_atendimento() -> None:
     st.session_state.servico_atendimento = ServicoAtendimento(root_agent)
     st.session_state.mensagens = []
     st.session_state.atendimento_encerrado = False
+    st.session_state.pop("mensagem_pendente", None)
+    st.session_state.pop("resposta_rapida_selecionada", None)
 
     try:
         resultado = st.session_state.servico_atendimento.enviar_mensagem(
@@ -156,6 +177,30 @@ def _rolar_historico_se_necessario() -> None:
     st.html(ROLAGEM_HISTORICO, unsafe_allow_javascript=True)
 
 
+def _exibir_indicador_digitacao() -> None:
+    with st.container(key="mensagem-assistente-digitando"):
+        with st.chat_message("Banco Ágil", avatar=":material/account_balance:"):
+            st.markdown(INDICADOR_DIGITACAO, unsafe_allow_html=True)
+
+
+def _processar_mensagem_pendente(texto: str) -> None:
+    try:
+        resultado = st.session_state.servico_atendimento.enviar_mensagem(texto)
+    except Exception:
+        logger.exception("Falha ao processar mensagem do atendimento")
+        respostas = (MENSAGEM_ERRO,)
+        atendimento_encerrado = False
+        opcoes_resposta = ()
+    else:
+        respostas = resultado.mensagens
+        atendimento_encerrado = resultado.encerrado
+        opcoes_resposta = resultado.opcoes_resposta
+
+    _adicionar_respostas(respostas, opcoes_resposta)
+    st.session_state.atendimento_encerrado = atendimento_encerrado
+    st.session_state.pop("mensagem_pendente", None)
+
+
 st.set_page_config(
     page_title="Banco Ágil | Atendimento",
     page_icon=":material/account_balance:",
@@ -167,12 +212,18 @@ st.markdown(
     <style>
     :root {
         color-scheme: light;
+        --azul-banco: #0b3158;
+        --azul-profundo: #071f38;
+        --azul-interacao: #124a7d;
+        --dourado-banco: #b4945a;
+        --fundo-pagina: #e9edf0;
+        --fundo-conversa: #f4f5f6;
+        --borda: #cdd3d8;
+        --texto: #172b3d;
     }
     html, body, [data-testid="stAppViewContainer"], .stApp {
-        background:
-            radial-gradient(circle at 15% 10%, #123c69 0, transparent 34%),
-            radial-gradient(circle at 85% 90%, #0b4350 0, transparent 30%),
-            #061a35;
+        background: var(--fundo-pagina);
+        color: var(--texto);
     }
     [data-testid="stHeader"], #MainMenu, footer,
     [data-testid="stDecoration"] {
@@ -182,83 +233,114 @@ st.markdown(
         align-items: center !important;
         box-sizing: border-box !important;
         display: flex !important;
-        max-width: 940px;
+        max-width: 980px;
         min-height: 100vh !important;
-        padding: 1.5rem 1rem;
+        padding: 2rem 1rem;
     }
     .stMainBlockContainer > [data-testid="stVerticalBlock"] {
         width: 100%;
     }
     .st-key-janela-atendimento {
-        background: #f7f9fc;
-        border: 1px solid rgba(255, 255, 255, 0.5);
-        border-radius: 30px;
-        box-shadow: 0 30px 80px rgba(0, 8, 24, 0.4);
+        background: #ffffff;
+        border: 1px solid #bcc5cc;
+        border-radius: 4px;
+        border-top: 4px solid var(--dourado-banco);
+        box-shadow: 0 12px 32px rgba(18, 38, 55, 0.12);
         margin: 0 auto;
-        max-width: 760px;
+        max-width: 820px;
         overflow: hidden;
     }
     .cabecalho-banco {
         align-items: center;
-        background: #ffffff;
-        border-bottom: 1px solid #e3e8ef;
+        background: var(--azul-banco);
+        border-bottom: 1px solid var(--azul-profundo);
+        color: #ffffff;
         display: flex;
-        gap: 0.85rem;
+        justify-content: space-between;
         margin: 0;
-        padding: 1.15rem 1.4rem;
+        padding: 1.25rem 1.5rem;
+    }
+    .marca-banco {
+        align-items: center;
+        display: flex;
+        gap: 0.9rem;
     }
     .icone-banco {
         align-items: center;
-        background: linear-gradient(145deg, #173f91, #08275e);
-        border-radius: 50%;
-        box-shadow: 0 8px 20px rgba(10, 44, 102, 0.2);
+        border: 1px solid rgba(255, 255, 255, 0.55);
+        border-radius: 3px;
         display: flex;
-        height: 46px;
+        height: 42px;
         justify-content: center;
-        width: 46px;
+        width: 42px;
     }
     .icone-banco svg {
         fill: #ffffff;
-        height: 23px;
-        width: 23px;
+        height: 22px;
+        width: 22px;
+    }
+    .cabecalho-banco .nome-instituicao {
+        color: #d8c49f;
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        line-height: 1;
+        margin: 0 0 0.35rem;
+        text-transform: uppercase;
     }
     .cabecalho-banco h1 {
-        color: #102653;
-        font-size: 1.08rem;
-        font-weight: 750;
-        letter-spacing: -0.01em;
+        color: #ffffff;
+        font-size: 1.12rem;
+        font-weight: 650;
+        letter-spacing: 0.01em;
         line-height: 1.2;
-        margin: 0 0 0.3rem;
-    }
-    .cabecalho-banco p {
-        align-items: center;
-        color: #68758a;
-        display: flex;
-        font-size: 0.78rem;
-        gap: 0.4rem;
         margin: 0;
     }
+    .seguranca-atendimento {
+        align-items: center;
+        display: flex;
+        gap: 0.6rem;
+    }
+    .seguranca-atendimento > svg {
+        fill: #d8c49f;
+        height: 19px;
+        width: 19px;
+    }
+    .seguranca-atendimento strong,
+    .seguranca-atendimento span {
+        display: block;
+        line-height: 1.25;
+    }
+    .seguranca-atendimento strong {
+        color: #ffffff;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .seguranca-atendimento span {
+        color: #c3cfda;
+        font-size: 0.68rem;
+        margin-top: 0.2rem;
+    }
     .status-online {
-        background: #23b77d;
+        background: #56bb8a;
         border-radius: 50%;
-        box-shadow: 0 0 0 3px rgba(35, 183, 125, 0.13);
+        display: inline-block;
         height: 6px;
+        margin-right: 0.35rem;
+        vertical-align: 1px;
         width: 6px;
     }
     .st-key-historico-chat {
-        background:
-            linear-gradient(rgba(247, 249, 252, 0.88), rgba(247, 249, 252, 0.88)),
-            radial-gradient(circle at 20% 20%, #dce8ff, transparent 35%),
-            radial-gradient(circle at 80% 80%, #d7f2e7, transparent 32%);
-        padding: 1.4rem 1.5rem;
-        scrollbar-color: #b9c5d5 transparent;
+        background: var(--fundo-conversa);
+        padding: 1.5rem;
+        scrollbar-color: #aeb7be transparent;
         scrollbar-width: thin;
     }
     [data-testid="stChatMessage"] {
         align-items: flex-end !important;
         background: transparent;
         display: flex !important;
-        gap: 12px !important;
+        gap: 10px !important;
         justify-content: flex-start !important;
         margin: 0;
         padding: 0;
@@ -266,34 +348,33 @@ st.markdown(
     }
     [data-testid^="stChatMessageAvatar"] {
         align-items: center;
-        background: #163d8d !important;
-        border: 3px solid #ffffff;
-        border-radius: 50% !important;
-        box-shadow: 0 5px 14px rgba(20, 43, 95, 0.16);
+        background: var(--azul-banco) !important;
+        border: 0;
+        border-radius: 3px !important;
         color: #ffffff !important;
         display: flex !important;
-        flex: 0 0 40px !important;
-        height: 40px !important;
+        flex: 0 0 36px !important;
+        height: 36px !important;
         justify-content: center;
-        width: 40px !important;
+        width: 36px !important;
     }
     [data-testid^="stChatMessageAvatar"] * {
         color: #ffffff !important;
         fill: #ffffff !important;
     }
     [data-testid="stChatMessageContent"] {
-        background: #e7eaff;
-        border: 1px solid #d8ddfa;
-        border-radius: 12px;
-        box-shadow: 0 8px 20px rgba(25, 51, 105, 0.07);
-        color: #102653;
+        background: #ffffff;
+        border: 1px solid #d5dade;
+        border-left: 3px solid var(--dourado-banco);
+        border-radius: 3px;
+        color: var(--texto);
         flex: 0 1 auto;
-        font-size: 0.94rem;
+        font-size: 0.92rem;
         height: auto !important;
-        line-height: 1.55;
+        line-height: 1.5;
         margin: 0 !important;
         max-width: min(75%, 560px);
-        padding: 9px 14px;
+        padding: 10px 13px;
         word-break: break-word;
         width: fit-content !important;
     }
@@ -314,35 +395,61 @@ st.markdown(
         justify-content: flex-start !important;
     }
     [class*="st-key-mensagem-cliente-"] [data-testid^="stChatMessageAvatar"] {
-        background: #08775d !important;
+        background: #647381 !important;
     }
     [class*="st-key-mensagem-cliente-"] [data-testid="stChatMessageContent"] {
-        background: #d8f3e7;
-        border-color: #c5e9da;
-        border-radius: 12px;
-        color: #123c35;
+        background: var(--azul-interacao);
+        border-color: var(--azul-interacao);
+        border-left-width: 1px;
+        border-radius: 3px;
+        color: #ffffff;
+    }
+    .st-key-mensagem-assistente-digitando .indicador-digitacao {
+        align-items: center;
+        display: flex;
+        gap: 5px;
+        height: 20px;
+        padding: 0 2px;
+    }
+    .st-key-mensagem-assistente-digitando .indicador-digitacao span {
+        animation: pulso-digitacao 1.15s infinite ease-in-out;
+        background: var(--azul-interacao);
+        border-radius: 50%;
+        height: 7px;
+        opacity: 0.35;
+        width: 7px;
+    }
+    .st-key-mensagem-assistente-digitando .indicador-digitacao span:nth-child(2) {
+        animation-delay: 0.16s;
+    }
+    .st-key-mensagem-assistente-digitando .indicador-digitacao span:nth-child(3) {
+        animation-delay: 0.32s;
+    }
+    @keyframes pulso-digitacao {
+        0%, 60%, 100% { transform: translateY(0); opacity: 0.35; }
+        30% { transform: translateY(-4px); opacity: 1; }
     }
     .st-key-area-envio {
         background: #ffffff;
-        border-top: 1px solid #e3e8ef;
-        padding: 1rem 1.3rem 1.2rem;
+        border-top: 1px solid var(--borda);
+        padding: 1rem 1.5rem 1.2rem;
     }
     [class*="st-key-opcoes-mensagem-"] {
         margin-top: 0.7rem;
     }
     [class*="st-key-opcao-mensagem-"] button {
         background: #ffffff;
-        border: 1px solid #5872bd;
-        border-radius: 9px;
-        color: #173f91;
+        border: 1px solid var(--azul-interacao);
+        border-radius: 3px;
+        color: var(--azul-banco);
         font-size: 0.8rem;
         font-weight: 650;
         min-height: 34px;
     }
     [class*="st-key-opcao-mensagem-"] button:hover {
-        background: #edf3ff;
-        border-color: #173f91;
-        color: #102653;
+        background: #edf2f6;
+        border-color: var(--azul-profundo);
+        color: var(--azul-profundo);
     }
     [class*="st-key-opcao-mensagem-"] button:disabled {
         background: #e4e8ed;
@@ -360,56 +467,77 @@ st.markdown(
     }
     [data-testid="stChatInput"] > div {
         align-items: center;
-        background: #f7f9fc;
-        border: 1px solid #cbd4e0;
-        border-radius: 18px;
-        box-shadow: 0 6px 18px rgba(17, 42, 84, 0.07);
-        min-height: 58px;
+        background: #ffffff;
+        border: 1px solid #aeb8c0;
+        border-radius: 3px;
+        min-height: 54px;
         width: 100%;
     }
     [data-testid="stChatInput"]:focus-within > div {
-        border-color: #5872bd;
-        box-shadow: 0 0 0 1px rgba(36, 70, 216, 0.12);
+        border-color: var(--azul-interacao);
+        box-shadow: 0 0 0 2px rgba(18, 74, 125, 0.12);
     }
     [data-testid="stChatInput"] textarea {
         align-self: center;
-        color: #102653;
+        color: var(--texto);
     }
     [data-testid="stChatInputSubmitButton"] {
         align-self: center;
-        background: #173f91;
-        border-radius: 13px;
+        background: var(--azul-banco);
+        border-radius: 2px;
         color: #ffffff;
         margin-right: 0.4rem;
     }
     [data-testid="stAlert"] {
-        background: #edf3ff;
-        border: 1px solid #d4e0f5;
-        border-radius: 16px;
-        color: #102653;
+        background: #edf2f6;
+        border: 1px solid #cbd5dd;
+        border-radius: 3px;
+        color: var(--texto);
     }
     .stButton > button[kind="primary"] {
-        background: #173f91;
-        border-color: #173f91;
-        border-radius: 15px;
+        background: var(--azul-banco);
+        border-color: var(--azul-banco);
+        border-radius: 3px;
         min-height: 46px;
     }
     @media (max-width: 640px) {
         .stMainBlockContainer {
             align-items: flex-start !important;
-            padding: 0.7rem 0.55rem;
+            padding: 0;
         }
         .st-key-janela-atendimento {
-            border-radius: 22px;
+            border-left: 0;
+            border-radius: 0;
+            border-right: 0;
+            max-width: none;
         }
         .cabecalho-banco {
-            padding: 1rem;
+            padding: 1rem 0.9rem;
+        }
+        .seguranca-atendimento strong {
+            font-size: 0.7rem;
+        }
+        .seguranca-atendimento span {
+            font-size: 0.63rem;
         }
         .st-key-historico-chat {
-            padding: 1.1rem 0.85rem;
+            padding: 1.1rem 0.8rem;
         }
         .st-key-area-envio {
             padding: 0.8rem;
+        }
+        [data-testid="stChatMessageContent"] {
+            max-width: calc(100% - 48px);
+        }
+    }
+    @media (max-width: 420px) {
+        .seguranca-atendimento > svg,
+        .seguranca-atendimento span {
+            display: none;
+        }
+        .icone-banco {
+            height: 38px;
+            width: 38px;
         }
     }
     </style>
@@ -421,6 +549,10 @@ if "servico_atendimento" not in st.session_state:
     _iniciar_atendimento()
 
 texto_usuario = st.session_state.pop("resposta_rapida_selecionada", None)
+if texto_usuario and "mensagem_pendente" not in st.session_state:
+    _agendar_mensagem(texto_usuario)
+mensagem_pendente = st.session_state.get("mensagem_pendente")
+
 with st.container(key="janela-atendimento"):
     st.markdown(CABECALHO_CHAT, unsafe_allow_html=True)
 
@@ -434,6 +566,8 @@ with st.container(key="janela-atendimento"):
             st.session_state.mensagens
         ):
             _exibir_mensagem(mensagem_atual, indice_mensagem)
+        if mensagem_pendente:
+            _exibir_indicador_digitacao()
         _rolar_historico_se_necessario()
 
     with st.container(key="area-envio"):
@@ -455,27 +589,12 @@ with st.container(key="janela-atendimento"):
                 "Digite sua mensagem",
                 max_chars=1000,
                 submit_mode="disable",
+                disabled=bool(mensagem_pendente),
             )
-            if texto_digitado:
-                texto_usuario = texto_digitado
+            if texto_digitado and not mensagem_pendente:
+                _agendar_mensagem(texto_digitado)
+                st.rerun()
 
-if texto_usuario:
-    mensagem_usuario = {"autor": "cliente", "texto": texto_usuario}
-    st.session_state.mensagens.append(mensagem_usuario)
-    try:
-        resultado = st.session_state.servico_atendimento.enviar_mensagem(
-            texto_usuario
-        )
-    except Exception:
-        logger.exception("Falha ao processar mensagem do atendimento")
-        respostas = (MENSAGEM_ERRO,)
-        atendimento_encerrado = False
-        opcoes_resposta = ()
-    else:
-        respostas = resultado.mensagens
-        atendimento_encerrado = resultado.encerrado
-        opcoes_resposta = resultado.opcoes_resposta
-
-    _adicionar_respostas(respostas, opcoes_resposta)
-    st.session_state.atendimento_encerrado = atendimento_encerrado
+if mensagem_pendente:
+    _processar_mensagem_pendente(mensagem_pendente)
     st.rerun()

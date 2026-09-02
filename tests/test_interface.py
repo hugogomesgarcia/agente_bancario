@@ -44,6 +44,20 @@ class ServicoEncerramentoTeste:
         self.fechado = True
 
 
+class ServicoProcessamentoVisivelTeste:
+    def __init__(self):
+        self.mensagem_pendente_ao_enviar = None
+
+    def enviar_mensagem(self, texto):
+        import streamlit as st
+
+        self.mensagem_pendente_ao_enviar = st.session_state.mensagem_pendente
+        return ResultadoAtendimento(("Resposta concluída.",), False)
+
+    def fechar(self):
+        pass
+
+
 class InterfaceTest(unittest.TestCase):
     def setUp(self):
         self.aplicacao = AppTest.from_file(
@@ -157,6 +171,23 @@ class InterfaceTest(unittest.TestCase):
 
         self.assertEqual(
             [botao.label for botao in self.aplicacao.button], ["Sim", "Não"]
+        )
+
+    def test_registra_mensagem_pendente_antes_de_chamar_o_agente(self):
+        servico = ServicoProcessamentoVisivelTeste()
+        self._substituir_servico(servico)
+
+        self._enviar("cotação do iene")
+
+        self.assertEqual(servico.mensagem_pendente_ao_enviar, "cotação do iene")
+        self.assertNotIn("mensagem_pendente", self.aplicacao.session_state)
+        self.assertEqual(
+            self.aplicacao.chat_message[-2].markdown[0].value,
+            "cotação do iene",
+        )
+        self.assertEqual(
+            self.aplicacao.chat_message[-1].markdown[0].value,
+            "Resposta concluída.",
         )
 
 

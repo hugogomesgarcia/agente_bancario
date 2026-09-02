@@ -20,7 +20,6 @@ from .tools.consultar_client import (
     autenticar_cliente,
     consultar_cliente,
     normalizar_data_nascimento,
-    registrar_classificacao,
 )
 
 ETAPA_AUTENTICACAO = "etapa_autenticacao"
@@ -190,7 +189,6 @@ def interceptar_autenticacao_local(
 
     if callback_context.state.get("cliente_autenticado"):
         if not _requisicao_contem_retorno_de_ferramenta(llm_request):
-            callback_context.state["classificacao_registrada"] = None
             callback_context.state[guardrail.CONTEXTO_GUARDRAIL] = (
                 guardrail.POS_AUTENTICACAO
             )
@@ -208,10 +206,9 @@ O cliente está autenticado. Interprete a mensagem inteira e escolha a ação
 correta. Para consultas de limite, score ou aumento de crédito, transfira para
 credito com transfer_to_agent; não produza texto antes ou depois. Para entrevista
 de crédito, atualização, recálculo ou melhoria do score, transfira para
-entrevista_credito. Para câmbio ou cotação, chame registrar_classificacao com
-cambio. Essa ferramenta apenas registra uma classificação para desenvolvimento
-futuro e não encaminha o cliente. Depois do retorno, explique que câmbio ainda
-não está disponível.
+entrevista_credito. Para câmbio, cotação de moedas ou criptomoedas, transfira para
+cambio. Não interprete o par na triagem e não produza texto antes ou depois da
+transferência.
 
 Não assuma o papel do especialista, não responda à questão bancária, não peça
 valor, renda ou outros dados operacionais, não invente informações e não afirme
@@ -280,14 +277,13 @@ agente_triagem = Agent(
     instruction="""
 Você é exclusivamente o agente de triagem do Banco Ágil. A autenticação é
 conduzida localmente. Nunca revele dados cadastrais. Uma ferramenta só comprova
-o que o resultado dela declara; não transforme classificação em encaminhamento
-nem alegue consulta ou operação sem evidência. Crédito e entrevista de crédito
-estão disponíveis por transferência; câmbio ainda não está.
+o que o resultado dela declara e não alegue consulta ou operação sem evidência.
+Crédito, entrevista de crédito e câmbio estão disponíveis por transferência.
 Nunca assuma as funções dos especialistas. Siga também as instruções restritas
 adicionadas a cada turno. Para uma intenção de encerramento, use somente
 solicitar_confirmacao_encerramento; a sessão só será fechada após confirmação.
 """,
-    tools=[registrar_classificacao, solicitar_confirmacao_encerramento],
+    tools=[solicitar_confirmacao_encerramento],
     before_model_callback=interceptar_autenticacao_local,
     after_model_callback=guardrail.aplicar_guardrail_de_resposta,
     on_model_error_callback=guardrail.tratar_erro_do_modelo,

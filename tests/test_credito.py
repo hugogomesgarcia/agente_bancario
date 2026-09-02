@@ -48,7 +48,7 @@ class ModeloTransferenciaTeste(BaseLlm):
                 )
             )
             return
-        if "registrar_classificacao" in nomes:
+        if "solicitar_aumento_limite" not in nomes:
             chamada = types.FunctionCall(
                 name="transfer_to_agent", args={"agent_name": "credito"}
             )

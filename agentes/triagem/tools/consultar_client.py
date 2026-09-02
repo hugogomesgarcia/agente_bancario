@@ -198,18 +198,3 @@ def autenticar_cliente(cpf: str, data_nascimento: str, tool_context: ToolContext
     tool_context.state["cliente_autenticado"] = True
     tool_context.state["cpf_cliente"] = cpf_normalizado
     return {"autenticado": True, "mensagem": "Cliente autenticado com sucesso."}
-
-
-def registrar_classificacao(destino: str, tool_context: ToolContext) -> dict:
-    """Registra uma intenção para um agente especialista ainda indisponível."""
-    destinos = {"cambio"}
-    if destino not in destinos:
-        return {"registrado": False, "erro": "Classificação inválida."}
-
-    tool_context.state["classificacao_registrada"] = destino
-    return {
-        "registrado": True,
-        "destino": destino,
-        "encaminhamento_executado": False,
-        "mensagem": "Classificação registrada; agente especialista indisponível.",
-    }
