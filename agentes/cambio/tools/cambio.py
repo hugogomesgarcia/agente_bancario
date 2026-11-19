@@ -9,6 +9,12 @@ from urllib.request import Request, urlopen
 
 from google.adk.tools import ToolContext
 
+from agentes.credito.tools.credito import (
+    BaseCreditoIndisponivel,
+    cpf_cliente_autenticado,
+    ler_limite_atual,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +209,18 @@ def _consultar_cotacao(ativo_base: str, ativo_destino: str) -> dict:
     }
 
 
+def _limite_credito_atual(tool_context: ToolContext) -> Decimal | None:
+    cpf = cpf_cliente_autenticado(tool_context)
+    if cpf is None:
+        return None
+    try:
+        limite = ler_limite_atual(cpf)
+    except BaseCreditoIndisponivel:
+        logger.warning("Não foi possível ler o limite de crédito para conversão")
+        return None
+    return limite if limite > 0 else None
+
+
 def processar_solicitacao_cambio(
     status: str,
     destino_explicito: bool,
@@ -213,6 +231,7 @@ def processar_solicitacao_cambio(
     evidencia_base: str | None = None,
     evidencia_destino: str | None = None,
     evidencia_quantidade: str | None = None,
+    usar_limite_credito: bool = False,
     pergunta_esclarecimento: str | None = None,
 ) -> dict:
     """Interpreta toda a fala em um par ou registra uma pergunta de esclarecimento.
@@ -220,6 +239,9 @@ def processar_solicitacao_cambio(
     Use status "resolvido" somente quando o ativo base estiver claro. Use status
     "precisa_esclarecimento" se faltar informação ou houver ambiguidade. A
     moeda de destino é BRL apenas quando nenhuma foi expressa pelo cliente.
+    Use usar_limite_credito=True quando a quantidade for o limite de crédito do
+    próprio cliente: ativo_base BRL, sem quantidade_base e com o trecho que cita
+    o limite em evidencia_quantidade.
     """
     if status == "precisa_esclarecimento":
         pergunta = (
@@ -275,12 +297,24 @@ def processar_solicitacao_cambio(
         destino not in {None, "BRL"} or evidencia_destino_valida
     ):
         resultado = _erro("destino_padrao_inconsistente")
-    elif (quantidade_base is None) != (evidencia_quantidade is None):
+    elif usar_limite_credito and (
+        quantidade_base is not None or not evidencia_quantidade_valida
+    ):
+        resultado = _erro("quantidade_invalida")
+    elif usar_limite_credito and base != "BRL":
+        resultado = _erro("limite_credito_exige_brl")
+    elif not usar_limite_credito and (
+        (quantidade_base is None) != (evidencia_quantidade is None)
+    ):
         resultado = _erro("quantidade_invalida")
     elif quantidade_base is not None and (
         quantidade is None or not evidencia_quantidade_valida
     ):
         resultado = _erro("quantidade_invalida")
+    elif usar_limite_credito and (
+        quantidade := _limite_credito_atual(tool_context)
+    ) is None:
+        resultado = _erro("limite_credito_indisponivel")
     else:
         destino = destino if destino_explicito else "BRL"
         if base == destino:
@@ -299,6 +333,9 @@ def processar_solicitacao_cambio(
                     total_venda = quantidade * Decimal(resultado["venda"])
                 resultado.update(
                     {
+                        "origem_quantidade": (
+                            "limite_credito" if usar_limite_credito else "cliente"
+                        ),
                         "quantidade_base": _decimal_texto(quantidade),
                         "evidencia_quantidade": evidencia_quantidade.strip(),
                         "total_compra": _decimal_texto(total_compra),

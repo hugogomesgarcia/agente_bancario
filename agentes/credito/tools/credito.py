@@ -221,31 +221,25 @@ def _registrar_resultado(tool_context: ToolContext, resultado: dict) -> dict:
         "invocation_id": getattr(tool_context, "invocation_id", None),
     }
     tool_context.state[RESULTADO_CREDITO] = resultado_completo
-    if resultado.get("sucesso") and resultado.get("tipo") in {
-        "consulta_limite",
-        "aumento_limite",
-    }:
-        if (
-            resultado.get("tipo") == "aumento_limite"
-            and resultado.get("status") == "rejeitado"
-        ):
+    if not resultado.get("sucesso"):
+        return resultado_completo
+    if resultado.get("tipo") == "aumento_limite":
+        if resultado.get("status") == "rejeitado":
             tool_context.state[ETAPA_CREDITO] = AGUARDANDO_DECISAO_ENTREVISTA
             tool_context.state[PENDENCIA_REANALISE] = {
-                "novo_limite_solicitado": resultado[
-                    "novo_limite_solicitado"
-                ]
+                "novo_limite_solicitado": resultado["novo_limite_solicitado"]
             }
         else:
             tool_context.state[ETAPA_CREDITO] = AGUARDANDO_PROXIMA_ACAO
             tool_context.state[PENDENCIA_REANALISE] = None
+    # Uma consulta no mesmo turno de uma rejeição não cancela a oferta de
+    # entrevista nem o pedido preservado para reanálise.
+    elif (
+        resultado.get("tipo") == "consulta_limite"
+        and tool_context.state.get(ETAPA_CREDITO) != AGUARDANDO_DECISAO_ENTREVISTA
+    ):
+        tool_context.state[ETAPA_CREDITO] = AGUARDANDO_PROXIMA_ACAO
     return resultado_completo
-
-
-def _validar_cliente_autenticado(tool_context: ToolContext) -> str | None:
-    if tool_context.state.get("cliente_autenticado") is not True:
-        return None
-    cpf = _normalizar_cpf(tool_context.state.get("cpf_cliente", ""))
-    return cpf if len(cpf) == 11 else None
 
 
 def _buscar_cliente(
@@ -317,22 +311,35 @@ def _limite_permitido(score: int) -> Decimal:
     return correspondentes[0]
 
 
+def ler_limite_atual(cpf: str) -> Decimal:
+    """Lê o limite vigente do CPF; falhas levantam BaseCreditoIndisponivel."""
+    with _bloquear_csv():
+        _restaurar_transacao_sem_lock()
+        _, clientes = _ler_csv(
+            CLIENTES_CSV, {COLUNA_CPF, COLUNA_SCORE, COLUNA_LIMITE}
+        )
+        _, cliente = _buscar_cliente(cpf, clientes)
+        _, limite = _dados_credito_cliente(cliente)
+    return limite
+
+
+def cpf_cliente_autenticado(tool_context: ToolContext) -> str | None:
+    if tool_context.state.get("cliente_autenticado") is not True:
+        return None
+    cpf = _normalizar_cpf(tool_context.state.get("cpf_cliente", ""))
+    return cpf if len(cpf) == 11 else None
+
+
 def consultar_limite_credito(tool_context: ToolContext) -> dict:
     """Consulta o limite atual do cliente já autenticado pela triagem."""
-    cpf = _validar_cliente_autenticado(tool_context)
+    cpf = cpf_cliente_autenticado(tool_context)
     if cpf is None:
         return _registrar_resultado(
             tool_context,
             {"sucesso": False, "erro": "cliente_nao_autenticado"},
         )
     try:
-        with _bloquear_csv():
-            _restaurar_transacao_sem_lock()
-            _, clientes = _ler_csv(
-                CLIENTES_CSV, {COLUNA_CPF, COLUNA_SCORE, COLUNA_LIMITE}
-            )
-            _, cliente = _buscar_cliente(cpf, clientes)
-            _, limite = _dados_credito_cliente(cliente)
+        limite = ler_limite_atual(cpf)
     except PerfilCreditoIndisponivel:
         return _registrar_resultado(
             tool_context,
@@ -355,7 +362,7 @@ def consultar_limite_credito(tool_context: ToolContext) -> dict:
 
 def consultar_score_credito(tool_context: ToolContext) -> dict:
     """Consulta o score atual do cliente já autenticado pela triagem."""
-    cpf = _validar_cliente_autenticado(tool_context)
+    cpf = cpf_cliente_autenticado(tool_context)
     if cpf is None:
         return _registrar_resultado(
             tool_context, {"sucesso": False, "erro": "cliente_nao_autenticado"}
@@ -439,7 +446,7 @@ def solicitar_aumento_limite(
     novo_limite_solicitado: str, tool_context: ToolContext
 ) -> dict:
     """Avalia e registra um novo limite total solicitado pelo cliente."""
-    cpf = _validar_cliente_autenticado(tool_context)
+    cpf = cpf_cliente_autenticado(tool_context)
     if cpf is None:
         return _registrar_resultado(
             tool_context,

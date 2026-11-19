@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from google.adk.models import LlmRequest
 from google.adk.models import LlmResponse
@@ -29,10 +29,13 @@ from agentes.entrevista_credito.agent import (
     confirmar_valor_monetario_informado,
     interceptar_entrevista,
     registrar_resposta_entrevista,
-    restringir_resposta_livre,
 )
 from agentes.entrevista_credito.tools import entrevista_credito
 from agentes.triagem.agent import agente_triagem
+
+
+AVALIADOR = "agentes.compartilhado.guardrail._avaliar_resposta_com_modelo"
+REESCRITOR = "agentes.compartilhado.guardrail._reescrever_resposta_com_modelo"
 
 
 class ModeloFluxoCompletoTeste(BaseLlm):
@@ -81,6 +84,7 @@ class ContextoEntrevistaTeste:
             )
         self.invocation_id = invocation_id
         self.user_content = None
+        self.session = SimpleNamespace(events=[])
         self.actions = SimpleNamespace(
             escalate=False,
             skip_summarization=False,
@@ -473,7 +477,9 @@ class EntrevistaCreditoTest(unittest.TestCase):
                     self.contexto.state[entrevista_credito.DADOS_ENTREVISTA], {}
                 )
 
-    def test_callback_de_saida_preserva_chamadas_e_bloqueia_texto_livre(self):
+    def test_callback_de_saida_preserva_chamadas_e_revisa_texto_livre(self):
+        revisar = agente_entrevista_credito.after_model_callback
+        self.contexto.state[ETAPA_ENTREVISTA] = AGUARDANDO_DESPESAS
         chamada = types.Part(
             function_call=types.FunctionCall(
                 name="registrar_resposta_entrevista",
@@ -486,10 +492,7 @@ class EntrevistaCreditoTest(unittest.TestCase):
         resposta_mista = LlmResponse(
             content=types.Content(
                 role="model",
-                parts=[
-                    types.Part.from_text(text="Seu score será alto."),
-                    chamada,
-                ],
+                parts=[types.Part.from_text(text="Seu score será alto."), chamada],
             )
         )
         somente_texto = LlmResponse(
@@ -499,12 +502,67 @@ class EntrevistaCreditoTest(unittest.TestCase):
             )
         )
 
-        self.assertIsNone(restringir_resposta_livre(self.contexto, somente_chamada))
-        filtrada = restringir_resposta_livre(self.contexto, resposta_mista)
-        bloqueada = restringir_resposta_livre(self.contexto, somente_texto)
+        self.assertIsNone(asyncio.run(revisar(self.contexto, somente_chamada)))
+        filtrada = asyncio.run(revisar(self.contexto, resposta_mista))
+        with patch(
+            AVALIADOR, new=AsyncMock(return_value=(False, "Promete score."))
+        ), patch(REESCRITOR, new=AsyncMock(return_value="Seu score será ótimo.")):
+            bloqueada = asyncio.run(revisar(self.contexto, somente_texto))
+
         self.assertEqual(filtrada.content.parts, [chamada])
-        self.assertNotIn("score será alto", bloqueada.content.parts[0].text)
-        self.assertIn("dado solicitado", bloqueada.content.parts[0].text)
+        texto = bloqueada.content.parts[0].text
+        self.assertNotIn("score será", texto)
+        self.assertEqual(
+            texto,
+            "Não consegui entender sua resposta. Qual é o total das suas "
+            "despesas fixas mensais?",
+        )
+
+    def test_duvida_durante_entrevista_e_respondida_e_pergunta_repetida(self):
+        revisar = agente_entrevista_credito.after_model_callback
+        interceptar_entrevista(self.contexto, self._requisicao("iniciar"))
+        interceptar_entrevista(self.contexto, self._requisicao("6000"))
+        requisicao = self._requisicao("por que vocês precisam disso?")
+
+        self.assertIsNone(interceptar_entrevista(self.contexto, requisicao))
+        self.assertIn("o sistema repetirá", requisicao.config.system_instruction)
+        self.assertEqual(self.contexto.state[ETAPA_ENTREVISTA], AGUARDANDO_EMPREGO)
+
+        with patch(AVALIADOR, new=AsyncMock(return_value=(True, "ok"))):
+            resposta = asyncio.run(
+                revisar(
+                    self.contexto,
+                    LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[
+                                types.Part.from_text(
+                                    text="Essas informações ajudam a recalcular "
+                                    "seu score."
+                                )
+                            ],
+                        )
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            resposta.content.parts[0].text,
+            "Essas informações ajudam a recalcular seu score. Qual é o seu tipo "
+            "de emprego: formal, autônomo ou desempregado?",
+        )
+        self.assertEqual(
+            self.contexto.state[OPCOES_RESPOSTA],
+            ["Formal", "Autônomo", "Desempregado"],
+        )
+        self.assertEqual(
+            self.contexto.state[entrevista_credito.DADOS_ENTREVISTA],
+            {"renda_mensal": "6000.00"},
+        )
+
+    def test_agente_so_transfere_para_a_triagem(self):
+        self.assertTrue(agente_entrevista_credito.disallow_transfer_to_peers)
+        self.assertIn("transfira para triagem", agente_entrevista_credito.instruction)
 
     def test_ultima_resposta_interpretada_mantem_etapa_ate_concluir(self):
         self.contexto.state[ETAPA_ENTREVISTA] = AGUARDANDO_DIVIDAS

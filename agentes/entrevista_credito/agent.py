@@ -1,5 +1,3 @@
-import logging
-import os
 import re
 
 from google.adk.agents import Agent
@@ -14,15 +12,20 @@ from agentes.compartilhado.encerramento import (
     solicitar_confirmacao_encerramento,
     tratar_confirmacao_encerramento,
 )
+from agentes.compartilhado.guardrail import (
+    PerfilRevisao,
+    PerguntaPendente,
+    criar_revisao_de_resposta,
+    criar_tratamento_de_erro,
+    extrair_fatos,
+)
+from agentes.compartilhado.modelo import configuracao_geracao, criar_modelo
 from agentes.compartilhado.valores import normalizar_valor_monetario
 from .tools.entrevista_credito import (
     DADOS_ENTREVISTA,
     concluir_entrevista_credito,
     normalizar_numero_dependentes,
 )
-
-
-logger = logging.getLogger(__name__)
 
 ETAPA_ENTREVISTA = "etapa_entrevista_credito"
 AGUARDANDO_RENDA = "aguardando_renda_mensal"
@@ -42,6 +45,37 @@ PROXIMAS_ETAPAS = {
     AGUARDANDO_DEPENDENTES: AGUARDANDO_DIVIDAS,
     AGUARDANDO_DIVIDAS: CONCLUIR_ENTREVISTA,
 }
+CAMPOS_MONETARIOS = {
+    AGUARDANDO_RENDA: "renda_mensal",
+    AGUARDANDO_DESPESAS: "despesas_fixas",
+}
+PERGUNTAS = {
+    AGUARDANDO_RENDA: PerguntaPendente(
+        "Qual é a sua renda mensal?", termos=("renda",)
+    ),
+    AGUARDANDO_EMPREGO: PerguntaPendente(
+        "Qual é o seu tipo de emprego: formal, autônomo ou desempregado?",
+        ("Formal", "Autônomo", "Desempregado"),
+        ("emprego", "trabalho"),
+    ),
+    AGUARDANDO_DESPESAS: PerguntaPendente(
+        "Qual é o total das suas despesas fixas mensais?", termos=("despesa",)
+    ),
+    AGUARDANDO_DEPENDENTES: PerguntaPendente(
+        "Quantos dependentes você possui?", termos=("dependente",)
+    ),
+    AGUARDANDO_DIVIDAS: PerguntaPendente(
+        "Você possui dívidas ativas? Responda sim ou não.",
+        ("Sim", "Não"),
+        ("dívida", "divida"),
+    ),
+}
+INSTRUCAO_FORA_DA_PERGUNTA = (
+    "Se a mensagem não responder à pergunta atual (dúvida, comentário ou "
+    "conversa), não chame ferramentas: responda em uma ou duas frases; o sistema "
+    "repetirá a pergunta atual. Para outro assunto fora da entrevista, use "
+    "transfer_to_agent para triagem; a entrevista ficará pausada."
+)
 
 
 def _resposta(texto: str) -> LlmResponse:
@@ -123,18 +157,14 @@ def registrar_resposta_entrevista(
     return resultado
 
 
-def _resposta_apos_registro_interpretado(callback_context: CallbackContext) -> LlmResponse:
-    etapa = callback_context.state.get(ETAPA_ENTREVISTA)
-    if etapa == AGUARDANDO_EMPREGO:
-        callback_context.state[OPCOES_RESPOSTA] = ["Formal", "Autônomo", "Desempregado"]
-        return _resposta("Qual é o seu tipo de emprego: formal, autônomo ou desempregado?")
-    if etapa == AGUARDANDO_DESPESAS:
-        return _resposta("Qual é o total das suas despesas fixas mensais?")
-    if etapa == AGUARDANDO_DEPENDENTES:
-        return _resposta("Quantos dependentes você possui?")
-    if etapa == AGUARDANDO_DIVIDAS:
-        callback_context.state[OPCOES_RESPOSTA] = ["Sim", "Não"]
-        return _resposta("Você possui dívidas ativas? Responda sim ou não.")
+def _perguntar(callback_context: CallbackContext, etapa: str) -> LlmResponse:
+    pergunta = PERGUNTAS[etapa]
+    if pergunta.opcoes:
+        callback_context.state[OPCOES_RESPOSTA] = list(pergunta.opcoes)
+    return _resposta(pergunta.texto)
+
+
+def _concluir(callback_context: CallbackContext) -> LlmResponse:
     resultado = concluir_entrevista_credito(callback_context)
     if not resultado.get("sucesso"):
         callback_context.state[ETAPA_ENTREVISTA] = AGUARDANDO_DIVIDAS
@@ -152,6 +182,17 @@ def _resposta_apos_registro_interpretado(callback_context: CallbackContext) -> L
     )
 
 
+def _avancar(callback_context: CallbackContext, campo: str, valor) -> LlmResponse:
+    dados = dict(_dados(callback_context))
+    dados[campo] = valor
+    callback_context.state[DADOS_ENTREVISTA] = dados
+    proxima = PROXIMAS_ETAPAS[callback_context.state.get(ETAPA_ENTREVISTA)]
+    if proxima == CONCLUIR_ENTREVISTA:
+        return _concluir(callback_context)
+    callback_context.state[ETAPA_ENTREVISTA] = proxima
+    return _perguntar(callback_context, proxima)
+
+
 def confirmar_valor_monetario_informado(
     valor: str, tool_context: ToolContext
 ) -> dict:
@@ -166,24 +207,75 @@ def confirmar_valor_monetario_informado(
     return resultado
 
 
-def _requisicao_contem_retorno_de_ferramenta(llm_request: LlmRequest) -> bool:
-    return any(
-        parte.function_response
+def _ferramentas_retornadas(llm_request: LlmRequest) -> set[str]:
+    return {
+        parte.function_response.name
         for conteudo in llm_request.contents[-1:]
         for parte in conteudo.parts or []
-    )
+        if parte.function_response and parte.function_response.name
+    }
 
 
 def _pedir_interpretacao_de_valor(llm_request: LlmRequest) -> None:
     llm_request.append_instructions(
         [
-            "A resposta atual informa um valor financeiro em linguagem natural. "
-            "Extraia somente o valor que o cliente declarou e chame "
+            "Se a resposta atual informar um valor financeiro em linguagem "
+            "natural, extraia somente o valor que o cliente declarou e chame "
             "confirmar_valor_monetario_informado com o número normalizado. Por "
             "exemplo, sete mil reais e 7k devem ser enviados como 7000. Não estime "
-            "nem invente números. Se não houver um valor identificável, peça que o "
-            "cliente informe renda ou despesas com um valor numérico."
+            "nem invente números. " + INSTRUCAO_FORA_DA_PERGUNTA
         ]
+    )
+
+
+def _interpretar_campo(llm_request: LlmRequest, instrucao: str) -> None:
+    llm_request.append_instructions([f"{instrucao} {INSTRUCAO_FORA_DA_PERGUNTA}"])
+
+
+def _responder_retorno_de_ferramenta(
+    callback_context: CallbackContext, llm_request: LlmRequest, etapa: str
+) -> LlmResponse | None:
+    ferramentas = _ferramentas_retornadas(llm_request)
+
+    if "registrar_resposta_entrevista" in ferramentas:
+        registro = callback_context.state.get(REGISTRO_ENTREVISTA_INTERPRETADO)
+        callback_context.state[REGISTRO_ENTREVISTA_INTERPRETADO] = None
+        if isinstance(registro, dict) and registro.get("sucesso"):
+            return _avancar(
+                callback_context, registro["campo_registrado"], registro["valor"]
+            )
+        return _resposta(
+            "Não consegui validar essa resposta. "
+            + PERGUNTAS[etapa].texto
+        )
+
+    if "confirmar_valor_monetario_informado" not in ferramentas:
+        return None
+    resultado = callback_context.state.get(VALOR_MONETARIO_INTERPRETADO)
+    callback_context.state[VALOR_MONETARIO_INTERPRETADO] = None
+    if isinstance(resultado, dict) and resultado.get("sucesso"):
+        callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 0
+        return _avancar(
+            callback_context,
+            CAMPOS_MONETARIOS[etapa],
+            resultado["valor_normalizado"],
+        )
+    if int(callback_context.state.get(TENTATIVAS_INTERPRETACAO_VALOR, 0)) == 0:
+        callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 1
+        llm_request.append_instructions(
+            [
+                "A ferramenta rejeitou o formato enviado. Se a mensagem do "
+                "cliente contiver um valor claro, chame-a novamente uma única "
+                "vez com somente o número decimal normalizado, por exemplo "
+                "12k deve ser 12000. Se não houver valor claro, não chame "
+                "ferramentas e não estime; o sistema repetirá a pergunta."
+            ]
+        )
+        return None
+    callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 0
+    return _resposta(
+        "Informe sua renda ou despesas mensais usando um valor numérico "
+        "igual ou maior que zero."
     )
 
 
@@ -217,70 +309,30 @@ def interceptar_entrevista(
         callback_context.state[DADOS_ENTREVISTA] = {}
         callback_context.state[ETAPA_ENTREVISTA] = AGUARDANDO_RENDA
         return _resposta(
-            "Vamos iniciar sua entrevista de crédito. Qual é a sua renda mensal?"
+            "Vamos iniciar sua entrevista de crédito. "
+            + PERGUNTAS[AGUARDANDO_RENDA].texto
+        )
+    if etapa not in PERGUNTAS:
+        callback_context.state[ETAPA_ENTREVISTA] = None
+        callback_context.state[DADOS_ENTREVISTA] = None
+        return _resposta("Vamos reiniciar a entrevista de crédito.")
+
+    if any(
+        parte.function_response
+        for conteudo in llm_request.contents[-1:]
+        for parte in conteudo.parts or []
+    ):
+        return _responder_retorno_de_ferramenta(
+            callback_context, llm_request, etapa
         )
 
-    if _requisicao_contem_retorno_de_ferramenta(llm_request):
-        registro = callback_context.state.get(REGISTRO_ENTREVISTA_INTERPRETADO)
-        callback_context.state[REGISTRO_ENTREVISTA_INTERPRETADO] = None
-        if isinstance(registro, dict):
-            if registro.get("sucesso"):
-                dados = dict(_dados(callback_context))
-                dados[registro["campo_registrado"]] = registro["valor"]
-                callback_context.state[DADOS_ENTREVISTA] = dados
-                callback_context.state[ETAPA_ENTREVISTA] = PROXIMAS_ETAPAS[etapa]
-                return _resposta_apos_registro_interpretado(callback_context)
-            return _resposta(
-                "Não consegui validar essa resposta. Informe o dado solicitado "
-                "novamente."
-            )
-
-    valor_interpretado = None
-    if _requisicao_contem_retorno_de_ferramenta(llm_request):
-        resultado = callback_context.state.get(VALOR_MONETARIO_INTERPRETADO)
-        callback_context.state[VALOR_MONETARIO_INTERPRETADO] = None
-        if not isinstance(resultado, dict) or not resultado.get("sucesso"):
-            tentativas = int(
-                callback_context.state.get(TENTATIVAS_INTERPRETACAO_VALOR, 0)
-            )
-            if tentativas == 0:
-                callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 1
-                llm_request.append_instructions(
-                    [
-                        "A ferramenta rejeitou o formato enviado. Se a mensagem do "
-                        "cliente contiver um valor claro, chame-a novamente uma única "
-                        "vez com somente o número decimal normalizado, por exemplo "
-                        "12k deve ser 12000. Se não houver valor claro, peça o dado "
-                        "ao cliente sem estimar."
-                    ]
-                )
-                return None
-            callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 0
-            return _resposta(
-                "Informe sua renda ou despesas mensais usando um valor numérico "
-                "igual ou maior que zero."
-            )
-        callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 0
-        valor_interpretado = resultado["valor_normalizado"]
-
-    dados = _dados(callback_context)
-    if etapa == AGUARDANDO_RENDA:
-        renda = normalizar_valor_monetario(valor_interpretado or texto)
-        if renda is None or renda < 0:
+    if etapa in CAMPOS_MONETARIOS:
+        valor = normalizar_valor_monetario(texto)
+        if valor is None or valor < 0:
             _pedir_interpretacao_de_valor(llm_request)
             return None
         callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 0
-        dados["renda_mensal"] = f"{renda:.2f}"
-        callback_context.state[DADOS_ENTREVISTA] = dados
-        callback_context.state[ETAPA_ENTREVISTA] = AGUARDANDO_EMPREGO
-        callback_context.state[OPCOES_RESPOSTA] = [
-            "Formal",
-            "Autônomo",
-            "Desempregado",
-        ]
-        return _resposta(
-            "Qual é o seu tipo de emprego: formal, autônomo ou desempregado?"
-        )
+        return _avancar(callback_context, CAMPOS_MONETARIOS[etapa], f"{valor:.2f}")
 
     if etapa == AGUARDANDO_EMPREGO:
         emprego = {
@@ -290,30 +342,15 @@ def interceptar_entrevista(
             "desempregado": "desempregado",
         }.get(_normalizar_texto(texto))
         if emprego is None:
-            llm_request.append_instructions(
-                [
-                    "Interprete o tipo de emprego informado e chame "
-                    "registrar_resposta_entrevista com tipo_emprego igual a "
-                    "formal, autonomo ou desempregado. Não deduza uma categoria "
-                    "se o cliente não a informou."
-                ]
+            _interpretar_campo(
+                llm_request,
+                "Interprete o tipo de emprego informado e chame "
+                "registrar_resposta_entrevista com tipo_emprego igual a "
+                "formal, autonomo ou desempregado. Não deduza uma categoria "
+                "se o cliente não a informou.",
             )
             return None
-        dados["tipo_emprego"] = emprego
-        callback_context.state[DADOS_ENTREVISTA] = dados
-        callback_context.state[ETAPA_ENTREVISTA] = AGUARDANDO_DESPESAS
-        return _resposta("Qual é o total das suas despesas fixas mensais?")
-
-    if etapa == AGUARDANDO_DESPESAS:
-        despesas = normalizar_valor_monetario(valor_interpretado or texto)
-        if despesas is None or despesas < 0:
-            _pedir_interpretacao_de_valor(llm_request)
-            return None
-        callback_context.state[TENTATIVAS_INTERPRETACAO_VALOR] = 0
-        dados["despesas_fixas"] = f"{despesas:.2f}"
-        callback_context.state[DADOS_ENTREVISTA] = dados
-        callback_context.state[ETAPA_ENTREVISTA] = AGUARDANDO_DEPENDENTES
-        return _resposta("Quantos dependentes você possui?")
+        return _avancar(callback_context, "tipo_emprego", emprego)
 
     if etapa == AGUARDANDO_DEPENDENTES:
         dependentes = (
@@ -322,96 +359,84 @@ def interceptar_entrevista(
             else None
         )
         if dependentes is None:
-            llm_request.append_instructions(
-                [
-                    "Interprete quantos dependentes financeiros o cliente "
-                    "informou e chame registrar_resposta_entrevista com "
-                    "numero_dependentes inteiro entre 0 e 1000. Não conte "
-                    "pessoas que o cliente não disse serem dependentes."
-                ]
+            _interpretar_campo(
+                llm_request,
+                "Interprete quantos dependentes financeiros o cliente "
+                "informou e chame registrar_resposta_entrevista com "
+                "numero_dependentes inteiro entre 0 e 1000. Não conte "
+                "pessoas que o cliente não disse serem dependentes.",
             )
             return None
-        dados["numero_dependentes"] = dependentes
-        callback_context.state[DADOS_ENTREVISTA] = dados
-        callback_context.state[ETAPA_ENTREVISTA] = AGUARDANDO_DIVIDAS
-        callback_context.state[OPCOES_RESPOSTA] = ["Sim", "Não"]
-        return _resposta("Você possui dívidas ativas? Responda sim ou não.")
+        return _avancar(callback_context, "numero_dependentes", dependentes)
 
-    if etapa == AGUARDANDO_DIVIDAS:
-        tem_dividas = {"sim": True, "não": False, "nao": False}.get(_normalizar_texto(texto))
-        if tem_dividas is None:
-            llm_request.append_instructions(
-                [
-                    "Interprete se o cliente declarou possuir dívidas ativas e "
-                    "chame registrar_resposta_entrevista com tem_dividas booleano. "
-                    "Não trate uma negativa sobre encerrar como resposta sobre "
-                    "dívidas."
-                ]
-            )
-            return None
-        dados["tem_dividas"] = tem_dividas
-        callback_context.state[DADOS_ENTREVISTA] = dados
-        resultado = concluir_entrevista_credito(callback_context)
-        if not resultado.get("sucesso"):
-            callback_context.state[OPCOES_RESPOSTA] = ["Sim", "Não"]
-            return _resposta(
-                "Não foi possível atualizar seu score agora. Responda novamente "
-                "se possui dívidas ativas para tentar outra vez."
-            )
-        callback_context.state[ETAPA_ENTREVISTA] = None
-        callback_context.state[DADOS_ENTREVISTA] = None
-        callback_context.actions.transfer_to_agent = "credito"
-        return _resposta(
-            f"Entrevista concluída. Seu score foi atualizado para "
-            f"{resultado['score_atualizado']}."
+    tem_dividas = {"sim": True, "não": False, "nao": False}.get(
+        _normalizar_texto(texto)
+    )
+    if tem_dividas is None:
+        _interpretar_campo(
+            llm_request,
+            "Interprete se o cliente declarou possuir dívidas ativas e "
+            "chame registrar_resposta_entrevista com tem_dividas booleano. "
+            "Não trate uma negativa sobre encerrar como resposta sobre "
+            "dívidas.",
         )
-
-    callback_context.state[ETAPA_ENTREVISTA] = None
-    callback_context.state[DADOS_ENTREVISTA] = None
-    return _resposta("Vamos reiniciar a entrevista de crédito.")
+        return None
+    return _avancar(callback_context, "tem_dividas", tem_dividas)
 
 
-def restringir_resposta_livre(
-    callback_context: CallbackContext, llm_response: LlmResponse
-) -> LlmResponse | None:
-    partes = llm_response.content.parts if llm_response.content else []
-    chamadas = [parte for parte in partes or [] if parte.function_call]
-    if chamadas:
-        if len(chamadas) == len(partes or []):
-            return None
-        return LlmResponse(content=types.Content(role="model", parts=chamadas))
-    return _resposta(
-        "Não consegui validar essa resposta. Informe novamente o dado solicitado "
-        "ou use uma das opções disponíveis."
-    )
+def _pergunta_pendente(estado) -> PerguntaPendente | None:
+    return PERGUNTAS.get(estado.get(ETAPA_ENTREVISTA))
 
 
-def tratar_erro_do_modelo(
-    callback_context: CallbackContext,
-    llm_request: LlmRequest,
-    error: Exception,
-) -> LlmResponse:
-    logger.error("Falha no modelo da entrevista de crédito: %s", type(error).__name__)
-    return _resposta(
-        "Não consegui interpretar essa resposta agora. Informe novamente o dado "
-        "solicitado ou use uma das opções disponíveis."
-    )
+PERFIL_REVISAO = PerfilRevisao(
+    agente="entrevista_credito",
+    escopo=lambda estado: (
+        "Entrevista de crédito em andamento. Coleta, uma por vez, renda mensal, "
+        "tipo de emprego, despesas fixas, número de dependentes e dívidas ativas "
+        "para recalcular o score do cliente. Pode responder com brevidade a "
+        "cumprimentos, comentários e dúvidas sobre a entrevista, como o motivo "
+        "das perguntas ou quantas faltam. Não calcula, estima nem promete score, "
+        "limite ou aprovação."
+    ),
+    resposta_segura=lambda estado: "Não consegui entender sua resposta.",
+    fatos_verificados=lambda estado: extrair_fatos(
+        estado,
+        DADOS_ENTREVISTA,
+        (
+            "renda_mensal",
+            "tipo_emprego",
+            "despesas_fixas",
+            "numero_dependentes",
+            "tem_dividas",
+        ),
+    ),
+    pergunta_pendente=_pergunta_pendente,
+)
 
 
 agente_entrevista_credito = Agent(
     name="entrevista_credito",
-    model=os.getenv("GOOGLE_MODEL", "gemini-3.5-flash-lite"),
+    model=criar_modelo(),
+    mode="chat",
+    generate_content_config=configuracao_geracao(),
     description=(
         "Conduz entrevista financeira, recalcula o score e retorna o cliente "
         "ao atendimento de crédito."
     ),
     instruction=(
-        "A entrevista é conduzida por um fluxo local determinístico. Não produza "
-        "respostas livres nem altere dados sem a ferramenta disponível. Para texto "
-        "livre de emprego, dependentes ou dívidas, interprete o campo atual e chame "
-        "registrar_resposta_entrevista; ela valida antes de alterar o estado. Se o cliente "
-        "parecer querer encerrar todo o atendimento, chame somente "
-        "solicitar_confirmacao_encerramento; ela não encerra a sessão."
+        "Você conduz a entrevista de crédito do Banco Ágil em português do Brasil, "
+        "com tom cordial e breve. O fluxo local faz as perguntas e altera os "
+        "dados; você só interpreta respostas livres. Para texto livre de emprego, "
+        "dependentes ou dívidas, interprete o campo atual e chame "
+        "registrar_resposta_entrevista; ela valida antes de alterar o estado. "
+        "Para valores de renda ou despesas, use "
+        "confirmar_valor_monetario_informado. Se o cliente fizer uma dúvida ou "
+        "comentário em vez de responder, responda brevemente sem ferramentas e "
+        "sem repetir a pergunta: o sistema a acrescentará. As perguntas servem "
+        "para recalcular o score; não calcule nem prometa score, limite ou "
+        "aprovação. Para outro assunto fora da entrevista, transfira para "
+        "triagem. Se o cliente parecer querer encerrar todo o atendimento, chame "
+        "somente solicitar_confirmacao_encerramento; ela não encerra a sessão."
     ),
     tools=[
         confirmar_valor_monetario_informado,
@@ -419,6 +444,7 @@ agente_entrevista_credito = Agent(
         solicitar_confirmacao_encerramento,
     ],
     before_model_callback=interceptar_entrevista,
-    after_model_callback=restringir_resposta_livre,
-    on_model_error_callback=tratar_erro_do_modelo,
+    after_model_callback=criar_revisao_de_resposta(PERFIL_REVISAO),
+    on_model_error_callback=criar_tratamento_de_erro(PERFIL_REVISAO),
+    disallow_transfer_to_peers=True,
 )

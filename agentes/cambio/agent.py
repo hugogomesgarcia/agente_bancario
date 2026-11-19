@@ -1,5 +1,4 @@
 import logging
-import os
 
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
@@ -14,6 +13,7 @@ from agentes.compartilhado.encerramento import (
     tratar_confirmacao_encerramento,
 )
 from agentes.compartilhado.estado import OPCOES_RESPOSTA
+from agentes.compartilhado.modelo import configuracao_geracao, criar_modelo
 from .tools.cambio import (
     AGUARDANDO_ESCLARECIMENTO,
     AGUARDANDO_PROXIMA_ACAO,
@@ -26,6 +26,17 @@ from .tools.cambio import (
 
 
 logger = logging.getLogger(__name__)
+
+ERROS_DE_CONTRATO = frozenset(
+    {
+        "ativo_base_invalido",
+        "ativo_destino_explicito_invalido",
+        "destino_padrao_inconsistente",
+        "limite_credito_exige_brl",
+        "status_invalido",
+        "pergunta_esclarecimento_ausente",
+    }
+)
 
 
 def _resposta(texto: str) -> LlmResponse:
@@ -85,8 +96,13 @@ def _resposta_cotacao(resultado: dict) -> str:
         quantidade = _formatar_decimal(resultado["quantidade_base"])
         total_compra = _formatar_decimal(resultado["total_compra"])
         total_venda = _formatar_decimal(resultado["total_venda"])
+        origem = (
+            f"o seu limite de crédito atual de {quantidade} {base}"
+            if resultado.get("origem_quantidade") == "limite_credito"
+            else f"{quantidade} {base}"
+        )
         texto += (
-            f" Para {quantidade} {base}, o valor correspondente é {destino} "
+            f" Para {origem}, o valor correspondente é {destino} "
             f"{total_compra} pela cotação de compra e {destino} {total_venda} "
             "pela cotação de venda."
         )
@@ -104,14 +120,14 @@ def _resposta_erro(resultado: dict) -> str:
             "Não consegui identificar a quantidade a converter. Informe um valor "
             "numérico positivo e as moedas desejadas."
         )
-    if erro in {
-        "ativo_base_invalido",
-        "ativo_destino_explicito_invalido",
-        "destino_padrao_inconsistente",
-        "status_invalido",
-        "pergunta_esclarecimento_ausente",
-    }:
+    if erro in ERROS_DE_CONTRATO:
         return "Não consegui identificar o par com segurança. Informe as moedas ou criptomoedas que deseja comparar."
+    if erro == "limite_credito_indisponivel":
+        return (
+            "Não consegui consultar seu limite de crédito para fazer a conversão "
+            "agora. Você pode tentar novamente ou informar o valor que deseja "
+            "converter."
+        )
     if erro == "ativos_iguais":
         return "As duas pontas da cotação são iguais. Com qual outra moeda ou criptomoeda você deseja comparar?"
     if erro == "par_nao_disponivel":
@@ -188,13 +204,8 @@ def interceptar_fluxo_cambio(
                 ]
                 return _resposta(_resposta_cotacao(resultado))
 
-            if resultado.get("erro") in {
-                "ativo_base_invalido",
-                "ativo_destino_explicito_invalido",
-                "destino_padrao_inconsistente",
-                "quantidade_invalida",
-                "status_invalido",
-                "pergunta_esclarecimento_ausente",
+            if resultado.get("erro") in ERROS_DE_CONTRATO | {
+                "quantidade_invalida"
             }:
                 tentativas = int(
                     callback_context.state.get(TENTATIVAS_INTERPRETACAO, 0)
@@ -203,10 +214,13 @@ def interceptar_fluxo_cambio(
                     callback_context.state[TENTATIVAS_INTERPRETACAO] = 1
                     llm_request.append_instructions(
                         [
-                            "A chamada anterior violou o contrato da ferramenta. "
-                            "Releia a mensagem completa e tente uma única vez: não "
-                            "ignore destino ou quantidade explícitos e peça "
-                            "esclarecimento se o pedido não estiver claro."
+                            "A chamada anterior violou o contrato da ferramenta "
+                            f"({resultado.get('erro')}). Releia a mensagem "
+                            "completa e tente uma única vez: não ignore destino "
+                            "ou quantidade explícitos; para converter o limite de "
+                            "crédito do cliente use ativo_base BRL, "
+                            "usar_limite_credito true e nenhuma quantidade_base; "
+                            "peça esclarecimento se o pedido não estiver claro."
                         ]
                     )
                     return None
@@ -265,15 +279,16 @@ def tratar_erro_do_modelo(
 
 agente_cambio = Agent(
     name="cambio",
-    model=os.getenv("GOOGLE_MODEL", "gemini-3.5-flash-lite"),
+    model=criar_modelo(),
+    mode="chat",
     description=(
         "Interpreta solicitações de câmbio em linguagem natural e consulta "
         "cotações atuais de moedas e criptomoedas para clientes autenticados."
     ),
     instruction="""
-Você é exclusivamente o agente de câmbio do Banco Ágil. Interprete a mensagem
-inteira e o contexto da conversa semanticamente; não use correspondências
-parciais. Para toda consulta ou dúvida de par, chame somente
+Você é o agente de câmbio do Banco Ágil. Fale em português do Brasil.
+Interprete a mensagem inteira e o contexto da conversa semanticamente; não use
+correspondências parciais. Para toda consulta ou dúvida de par, chame somente
 processar_solicitacao_cambio e não produza texto antes ou depois da chamada.
 
 Use status resolvido quando identificar com segurança o ativo base. Informe os
@@ -288,6 +303,13 @@ com especial atenção expressões como "em", "para", "contra", "cotado em" e
 equivalentes. Exemplos: "moeda da China" é CNY/BRL; "moeda da China em euro" é
 CNY/EUR; "euro na moeda chinesa" é EUR/CNY; "real em dólar" é BRL/USD;
 "bitcoin" é BTC/BRL; "ethereum em euro" é ETH/EUR.
+
+Quando o cliente pedir para converter o próprio limite de crédito, inclusive por
+referência ao histórico (por exemplo, "quanto vale meu limite em libras" ou "e
+quanto isso dá em dólar?" logo após o limite ser informado), use status
+resolvido, ativo_base BRL, o destino pedido, usar_limite_credito true e
+evidencia_quantidade com o trecho que se refere ao limite. Não preencha
+quantidade_base nem copie valores do histórico: o sistema lê o limite atual.
 
 Quando o cliente informar uma quantidade a converter, preencha quantidade_base
 com o valor numérico na moeda base e evidencia_quantidade com o trecho exato que
@@ -310,14 +332,16 @@ porque um ativo foi mencionado. Você pode oferecer uma cotação atual caso o
 cliente queira consultá-la.
 
 Nunca produza valores de cotação. A ferramenta e a resposta local são as únicas
-fontes financeiras. Para outro assunto bancário, transfira silenciosamente para
-triagem. Para intenção de encerrar todo o atendimento, chame somente
-solicitar_confirmacao_encerramento.
+fontes financeiras. Você pode responder em texto, de forma breve e cordial, a
+cumprimentos, agradecimentos e dúvidas sobre o que a consulta de câmbio faz.
+Para outro assunto bancário, como limite, score ou entrevista de crédito,
+transfira silenciosamente para triagem. Para intenção de encerrar todo o
+atendimento, chame somente solicitar_confirmacao_encerramento.
 """,
     tools=[processar_solicitacao_cambio, solicitar_confirmacao_encerramento],
     before_model_callback=interceptar_fluxo_cambio,
     after_model_callback=filtrar_resposta_mista,
     on_model_error_callback=tratar_erro_do_modelo,
-    generate_content_config=types.GenerateContentConfig(temperature=0),
+    generate_content_config=configuracao_geracao(temperature=0),
     disallow_transfer_to_peers=True,
 )

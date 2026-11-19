@@ -199,6 +199,11 @@ conversa para o especialista adequado sem expor a troca na interface.
 - Conversão de quantidades, pares inversos e taxas cruzadas por BRL.
 - Perguntas de esclarecimento antes da API quando o par é incompleto ou
   ambíguo.
+- Conversa natural fora do roteiro: cumprimentos antes da autenticação,
+  agradecimentos, dúvidas sobre a entrevista e pedidos compostos, como converter
+  o limite recém-aprovado para outra moeda.
+- Conversão do limite de crédito atual em qualquer moeda disponível, lido
+  diretamente da base de crédito.
 - Respostas rápidas para escolhas fechadas e indicador visual de digitação.
 - Sessões isoladas por conversa na interface Streamlit.
 - Tratamento controlado de falhas de modelo, API e armazenamento.
@@ -273,6 +278,8 @@ sinal estruturado `event.actions.escalate`.
 4. Compra, venda, par e timestamp são validados antes da resposta.
 5. Pares inversos e taxas cruzadas por BRL são calculados localmente com
    `Decimal`.
+6. Para converter o próprio limite ("quanto vale meu limite em libras?"), o
+   modelo apenas sinaliza a intenção; o valor é lido do cadastro de crédito.
 
 ## Dados CSV
 
@@ -347,6 +354,15 @@ estado do ADK. A entrevista passou a copiar e reatribuir o rascunho completo a
 cada resposta. Um teste com `Runner` cobre os cinco turnos, a persistência, a
 transferência de volta e a reanálise.
 
+### Histórico perdido nas transferências
+
+Os especialistas respondiam bem ao roteiro, mas falhavam em continuações como
+"e quanto isso dá em dólar?". O `root_agent` é um clone da Triagem, e o clone
+não executa a etapa do ADK que marca os subagentes como `chat`; no ADK 2, um
+agente sem modo explícito transferido em tempo de execução vira `single_turn` e
+recebe apenas a mensagem atual. Todos os agentes declaram `mode="chat"`, e um
+teste com `Runner` garante que o especialista recebe os turnos anteriores.
+
 ### Consistência entre arquivos CSV
 
 Uma aprovação precisa atualizar o cadastro e o histórico, mas CSV não oferece
@@ -380,13 +396,30 @@ com score, limite, aprovação, rejeição, compra, venda ou conversão são mon
 localmente a partir dos CSVs ou de uma resposta validada da AwesomeAPI. Texto
 livre misturado a uma chamada de ferramenta é descartado.
 
-### Guardrail independente na Triagem
+### Atalhos locais sem engolir o restante da mensagem
 
-Respostas livres da Triagem passam por um segundo Gemini, que compara o texto
-proposto com as ferramentas disponíveis e as evidências reais do turno. Uma
-reprovação permite uma única reescrita. Falha do revisor, JSON inválido ou uma
-segunda reprovação produzem uma resposta local segura, sem exibir conteúdo não
-revisado.
+Pedidos simples, como "qual é meu limite?", são atendidos localmente sem chamar
+o modelo. Um atalho só é usado quando todas as palavras da mensagem pertencem ao
+vocabulário daquela intenção; qualquer complemento ("em libras", "isso", uma
+segunda pergunta) leva a mensagem inteira ao modelo. Assim, o especialista ativo
+atende o que lhe cabe e devolve o restante à Triagem, que encaminha ao agente
+correto.
+
+### Revisão independente de texto livre
+
+Respostas livres da Triagem, do Crédito e da Entrevista passam por
+`agentes/compartilhado/guardrail.py`. Números ausentes dos resultados das
+ferramentas e da mensagem do cliente são recusados localmente; em seguida, um
+segundo Gemini compara o texto com o escopo do agente, o histórico recente e os
+fatos verificados. Uma reprovação permite uma única reescrita. Falha do
+revisor, JSON inválido ou uma segunda reprovação produzem uma resposta local
+segura, sem exibir conteúdo não revisado. Quando uma etapa aguarda um dado, como
+CPF ou renda, o código acrescenta a pergunta pendente ao final da resposta
+aprovada, mantendo o fluxo determinístico mesmo após uma conversa paralela.
+
+As chamadas ao Gemini usam tempo limite de 20 segundos por tentativa e novas
+tentativas curtas para erros temporários (503/429) e conexões travadas, pois uma
+resposta livre revisada pode depender de até quatro chamadas.
 
 ### Portabilidade do armazenamento local
 

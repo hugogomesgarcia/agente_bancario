@@ -22,12 +22,15 @@ from agentes.credito.agent import (
     _solicitou_entrevista_credito,
     agente_credito,
     interceptar_fluxo_credito,
-    restringir_resposta_livre,
+    revisar_resposta,
 )
 from agentes.credito.tools import credito
 from agentes.agent import migrar_faixas_limite, root_agent
 from agentes.compartilhado.estado import OPCOES_RESPOSTA
-from agentes.compartilhado.encerramento import solicitar_confirmacao_encerramento
+from agentes.compartilhado.encerramento import (
+    AGUARDANDO_CONFIRMACAO_ENCERRAMENTO,
+    solicitar_confirmacao_encerramento,
+)
 from agentes.entrevista_credito.tools import entrevista_credito
 
 
@@ -79,11 +82,22 @@ class ContextoCreditoTeste:
             )
         self.invocation_id = invocation_id
         self.user_content = None
+        self.session = SimpleNamespace(events=[])
         self.actions = SimpleNamespace(
             escalate=False,
             skip_summarization=False,
             transfer_to_agent=None,
         )
+
+
+AVALIADOR = "agentes.compartilhado.guardrail._avaliar_resposta_com_modelo"
+REESCRITOR = "agentes.compartilhado.guardrail._reescrever_resposta_com_modelo"
+
+
+def _resposta_texto(texto):
+    return LlmResponse(
+        content=types.Content(role="model", parts=[types.Part.from_text(text=texto)])
+    )
 
 
 class FerramentasCreditoTest(unittest.TestCase):
@@ -203,6 +217,21 @@ class FerramentasCreditoTest(unittest.TestCase):
                 "novo_limite_solicitado"
             ],
             "15000.01",
+        )
+
+    def test_consulta_no_mesmo_turno_preserva_oferta_de_entrevista(self):
+        credito.solicitar_aumento_limite("15000.01", self.contexto)
+
+        resultado = credito.consultar_limite_credito(self.contexto)
+
+        self.assertEqual(resultado["limite_atual"], "5000.00")
+        self.assertEqual(
+            self.contexto.state[credito.ETAPA_CREDITO],
+            credito.AGUARDANDO_DECISAO_ENTREVISTA,
+        )
+        self.assertEqual(
+            self.contexto.state[credito.PENDENCIA_REANALISE],
+            {"novo_limite_solicitado": "15000.01"},
         )
 
     def test_perfil_de_referencia_aprova_limite_de_treze_mil(self):
@@ -468,6 +497,25 @@ class IntencoesCreditoTest(unittest.TestCase):
 
         self.assertFalse(_solicitou_aumento_limite("Não quero aumentar meu limite"))
 
+    def test_atalhos_ignoram_pedidos_compostos_ou_fora_do_roteiro(self):
+        for mensagem in (
+            "Quanto vale meu limite em libras?",
+            "E quanto isso dá em libras?",
+            "quanto é meu limite novo em dólar?",
+            "meu score está bom?",
+            "obrigado!",
+        ):
+            with self.subTest(mensagem=mensagem):
+                self.assertFalse(_solicitou_consulta_limite(mensagem))
+                self.assertFalse(_solicitou_consulta_score(mensagem))
+                self.assertFalse(_solicitou_aumento_sem_valor(mensagem))
+                self.assertFalse(_solicitou_entrevista_credito(mensagem))
+        self.assertFalse(
+            _solicitou_aumento_sem_valor("Quero aumentar meu limite em euros")
+        )
+        self.assertFalse(_solicitou_entrevista_credito("O que é essa entrevista?"))
+        self.assertFalse(_solicitou_entrevista_credito("Não quero entrevista"))
+
     def test_mil_e_k_contam_como_valor_informado(self):
         self.assertFalse(
             _solicitou_aumento_sem_valor("Quero aumentar meu limite para 9 mil")
@@ -478,24 +526,21 @@ class IntencoesCreditoTest(unittest.TestCase):
 
 
 class FluxoCreditoTest(unittest.TestCase):
-    def _requisicao(self, contexto, texto, *, retorno_ferramenta=False):
+    def _requisicao(self, contexto, texto, *, retornos=()):
         contexto.user_content = types.Content(
             role="user", parts=[types.Part.from_text(text=texto)]
         )
-        partes = [types.Part.from_text(text=texto)]
-        if retorno_ferramenta:
-            partes = [
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name="solicitar_aumento_limite", response={"sucesso": True}
-                    )
-                )
-            ]
+        partes = [
+            types.Part(
+                function_response=types.FunctionResponse(name=nome, response=resposta)
+            )
+            for nome, resposta in retornos
+        ] or [types.Part.from_text(text=texto)]
         return LlmRequest(contents=[types.Content(role="user", parts=partes)])
 
     def test_resposta_de_aprovacao_vem_da_evidencia_da_ferramenta(self):
         contexto = ContextoCreditoTeste()
-        contexto.state[credito.RESULTADO_CREDITO] = {
+        resultado = {
             "sucesso": True,
             "tipo": "aumento_limite",
             "status": "aprovado",
@@ -505,12 +550,52 @@ class FluxoCreditoTest(unittest.TestCase):
 
         resposta = interceptar_fluxo_credito(
             contexto,
-            self._requisicao(contexto, "8000", retorno_ferramenta=True),
+            self._requisicao(
+                contexto, "8000", retornos=[("solicitar_aumento_limite", resultado)]
+            ),
         )
 
         texto = resposta.content.parts[0].text
         self.assertIn("solicitação foi aprovada", texto)
         self.assertIn("R$ 8.000,00", texto)
+
+    def test_pedido_composto_responde_todas_as_ferramentas_do_turno(self):
+        contexto = ContextoCreditoTeste()
+        consulta = {
+            "sucesso": True,
+            "tipo": "consulta_limite",
+            "limite_atual": "5000.00",
+        }
+        rejeicao = {
+            "sucesso": True,
+            "tipo": "aumento_limite",
+            "status": "rejeitado",
+            "score_atual": 720,
+            "limite_atual": "5000.00",
+            "novo_limite_solicitado": "20000.00",
+            "limite_maximo_score": "16000.00",
+        }
+
+        resposta = interceptar_fluxo_credito(
+            contexto,
+            self._requisicao(
+                contexto,
+                "quero aumento para 20 mil e também consultar meu limite atual",
+                retornos=[
+                    ("solicitar_aumento_limite", rejeicao),
+                    ("consultar_limite_credito", consulta),
+                    ("consultar_limite_credito", consulta),
+                ],
+            ),
+        )
+
+        texto = resposta.content.parts[0].text
+        self.assertTrue(texto.startswith("Seu limite atual é R$ 5.000,00. Seu score"), texto)
+        self.assertEqual(texto.count("R$ 5.000,00"), 1)
+        self.assertIn("R$ 20.000,00 foi rejeitada", texto)
+        self.assertTrue(texto.endswith("Você deseja continuar com a entrevista?"))
+        self.assertEqual(contexto.state[OPCOES_RESPOSTA], ["Sim", "Não"])
+        self.assertIn("chame todas as ferramentas", agente_credito.instruction)
 
     def test_aumento_claro_sem_valor_mantem_etapa_aguardando_novo_limite(self):
         contexto = ContextoCreditoTeste()
@@ -730,7 +815,7 @@ class FluxoCreditoTest(unittest.TestCase):
 
     def test_rejeicao_oferece_entrevista_disponivel(self):
         contexto = ContextoCreditoTeste()
-        contexto.state[credito.RESULTADO_CREDITO] = {
+        resultado = {
             "sucesso": True,
             "tipo": "aumento_limite",
             "status": "rejeitado",
@@ -742,7 +827,9 @@ class FluxoCreditoTest(unittest.TestCase):
 
         resposta = interceptar_fluxo_credito(
             contexto,
-            self._requisicao(contexto, "12000", retorno_ferramenta=True),
+            self._requisicao(
+                contexto, "12000", retornos=[("solicitar_aumento_limite", resultado)]
+            ),
         )
 
         self.assertIn("entrevista de crédito", resposta.content.parts[0].text)
@@ -803,37 +890,22 @@ class FluxoCreditoTest(unittest.TestCase):
                     "novo_limite_solicitado": "8000.00"
                 },
                 "acao_entrevista_credito": "recusada",
-                credito.RESULTADO_CREDITO: {
-                    "sucesso": True,
-                    "tipo": "consulta_limite",
-                    "limite_atual": "5000.00",
-                },
             }
         )
-        contexto.user_content = types.Content(
-            role="user",
-            parts=[types.Part.from_text(text="Não, mas qual é meu limite?")],
-        )
-        requisicao = LlmRequest(
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part(
-                            function_response=types.FunctionResponse(
-                                name="recusar_entrevista_credito",
-                                response={"sucesso": True},
-                            )
-                        ),
-                        types.Part(
-                            function_response=types.FunctionResponse(
-                                name="consultar_limite_credito",
-                                response={"sucesso": True},
-                            )
-                        ),
-                    ],
-                )
-            ]
+        requisicao = self._requisicao(
+            contexto,
+            "Não, mas qual é meu limite?",
+            retornos=[
+                ("recusar_entrevista_credito", {"sucesso": True, "acao": "recusada"}),
+                (
+                    "consultar_limite_credito",
+                    {
+                        "sucesso": True,
+                        "tipo": "consulta_limite",
+                        "limite_atual": "5000.00",
+                    },
+                ),
+            ],
         )
 
         resposta = interceptar_fluxo_credito(contexto, requisicao)
@@ -965,17 +1037,172 @@ class FluxoCreditoTest(unittest.TestCase):
         self.assertEqual(solicitar.call_count, 2)
         self.assertIsNone(contexto.state[credito.PENDENCIA_REANALISE])
 
-    def test_assunto_sem_suporte_retorna_triagem_sem_apagar_autenticacao(self):
-        contexto = ContextoCreditoTeste()
-        contexto.state[credito.ETAPA_CREDITO] = credito.AGUARDANDO_PROXIMA_ACAO
+    def test_assunto_fora_do_credito_e_decidido_pelo_modelo(self):
+        for mensagem in (
+            "quero consultar câmbio",
+            "Quanto vale meu limite em libras?",
+            "obrigado!",
+        ):
+            with self.subTest(mensagem=mensagem):
+                contexto = ContextoCreditoTeste()
+                contexto.state[credito.ETAPA_CREDITO] = (
+                    credito.AGUARDANDO_PROXIMA_ACAO
+                )
 
-        interceptar_fluxo_credito(
-            contexto, self._requisicao(contexto, "quero consultar câmbio")
+                with patch(
+                    "agentes.credito.agent.consultar_limite_credito"
+                ) as consultar:
+                    resposta = interceptar_fluxo_credito(
+                        contexto, self._requisicao(contexto, mensagem)
+                    )
+
+                self.assertIsNone(resposta)
+                consultar.assert_not_called()
+                self.assertIsNone(contexto.actions.transfer_to_agent)
+                self.assertEqual(
+                    contexto.state[credito.ETAPA_CREDITO],
+                    credito.AGUARDANDO_PROXIMA_ACAO,
+                )
+        self.assertIn("quanto vale meu limite em libras", agente_credito.instruction)
+        self.assertIn("transfer_to_agent para triagem", agente_credito.instruction)
+
+    def test_transferencia_do_modelo_para_triagem_e_preservada(self):
+        contexto = ContextoCreditoTeste()
+        chamada = LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="transfer_to_agent", args={"agent_name": "triagem"}
+                        )
+                    )
+                ],
+            )
         )
 
-        self.assertEqual(contexto.actions.transfer_to_agent, "triagem")
-        self.assertTrue(contexto.state["cliente_autenticado"])
-        self.assertEqual(contexto.state["cpf_cliente"], "71048388050")
+        self.assertIsNone(asyncio.run(revisar_resposta(contexto, chamada)))
+
+    def test_recusa_com_pedido_fora_do_credito_registra_recusa_e_consulta_modelo(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state.update(
+            {
+                credito.ETAPA_CREDITO: credito.AGUARDANDO_DECISAO_ENTREVISTA,
+                credito.PENDENCIA_REANALISE: {"novo_limite_solicitado": "12000.00"},
+            }
+        )
+        requisicao = self._requisicao(
+            contexto, "Não, quanto vale meu limite em libras?"
+        )
+
+        resposta = interceptar_fluxo_credito(contexto, requisicao)
+
+        self.assertIsNone(resposta)
+        self.assertIsNone(contexto.state[credito.PENDENCIA_REANALISE])
+        self.assertEqual(
+            contexto.state[credito.ETAPA_CREDITO], credito.AGUARDANDO_PROXIMA_ACAO
+        )
+        self.assertIn("libras", requisicao.config.system_instruction)
+
+    def test_duvida_sobre_entrevista_nao_e_tratada_como_recusa(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state.update(
+            {
+                credito.ETAPA_CREDITO: credito.AGUARDANDO_DECISAO_ENTREVISTA,
+                credito.PENDENCIA_REANALISE: {"novo_limite_solicitado": "12000.00"},
+            }
+        )
+
+        resposta = interceptar_fluxo_credito(
+            contexto,
+            self._requisicao(contexto, "Não sei, como funciona a entrevista?"),
+        )
+
+        self.assertIsNone(resposta)
+        self.assertEqual(
+            contexto.state[credito.ETAPA_CREDITO],
+            credito.AGUARDANDO_DECISAO_ENTREVISTA,
+        )
+        self.assertEqual(
+            contexto.state[credito.PENDENCIA_REANALISE],
+            {"novo_limite_solicitado": "12000.00"},
+        )
+
+    def test_resposta_livre_repete_pergunta_pendente_com_opcoes(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state[credito.ETAPA_CREDITO] = credito.AGUARDANDO_DECISAO_ENTREVISTA
+        contexto.user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text="como funciona?")]
+        )
+
+        with patch(AVALIADOR, new=AsyncMock(return_value=(True, "ok"))):
+            resposta = asyncio.run(
+                revisar_resposta(
+                    contexto,
+                    _resposta_texto(
+                        "São cinco perguntas rápidas sobre sua situação financeira."
+                    ),
+                )
+            )
+
+        texto = resposta.content.parts[0].text
+        self.assertTrue(texto.startswith("São cinco perguntas"), texto)
+        self.assertTrue(texto.endswith("reajustar seu score?"), texto)
+        self.assertEqual(contexto.state[OPCOES_RESPOSTA], ["Sim", "Não"])
+
+    def test_pedido_diferente_na_retentativa_vai_ao_modelo(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state.update(
+            {
+                credito.ETAPA_CREDITO: "aguardando_retentativa_reanalise",
+                credito.PENDENCIA_REANALISE: {"novo_limite_solicitado": "8000.00"},
+            }
+        )
+
+        resposta = interceptar_fluxo_credito(
+            contexto, self._requisicao(contexto, "qual a cotação do euro?")
+        )
+
+        self.assertIsNone(resposta)
+        self.assertEqual(
+            contexto.state[credito.PENDENCIA_REANALISE],
+            {"novo_limite_solicitado": "8000.00"},
+        )
+
+    def test_retorno_da_confirmacao_de_encerramento_nao_repete_resultado(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state[credito.RESULTADO_CREDITO] = {
+            "sucesso": True,
+            "tipo": "consulta_limite",
+            "limite_atual": "5000.00",
+        }
+        solicitar_confirmacao_encerramento(contexto)
+        contexto.user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text="acho que é só isso")]
+        )
+        requisicao = LlmRequest(
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name="solicitar_confirmacao_encerramento",
+                                response={"sucesso": True},
+                            )
+                        )
+                    ],
+                )
+            ]
+        )
+
+        resposta = interceptar_fluxo_credito(contexto, requisicao)
+
+        self.assertEqual(
+            resposta.content.parts[0].text, "Posso fechar seu atendimento então?"
+        )
+        self.assertNotIn("R$ 5.000,00", resposta.content.parts[0].text)
+        self.assertTrue(contexto.state[AGUARDANDO_CONFIRMACAO_ENCERRAMENTO])
 
     def test_encerramento_no_credito_exige_confirmacao_explicita(self):
         contexto = ContextoCreditoTeste()
@@ -1000,18 +1227,65 @@ class FluxoCreditoTest(unittest.TestCase):
         self.assertIn("já foi encerrado", resposta.content.parts[0].text)
         self.assertTrue(contexto.actions.escalate)
 
-    def test_texto_financeiro_livre_do_modelo_e_substituido(self):
+    def test_numero_sem_evidencia_e_reescrito_sem_consultar_revisor(self):
         contexto = ContextoCreditoTeste()
-        candidata = LlmResponse(
-            content=types.Content(
-                role="model",
-                parts=[types.Part.from_text(text="Seu limite foi aprovado em 9000")],
+        contexto.user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text="e aí, aprovou?")]
+        )
+        avaliador = AsyncMock(return_value=(True, "ok"))
+        reescritor = AsyncMock(return_value="Seu limite também foi de 9000.")
+
+        with patch(AVALIADOR, avaliador), patch(REESCRITOR, reescritor):
+            resposta = asyncio.run(
+                revisar_resposta(
+                    contexto, _resposta_texto("Seu limite foi aprovado em 9000")
+                )
             )
+
+        texto = resposta.content.parts[0].text
+        self.assertNotIn("9000", texto)
+        self.assertIn("consultar seu limite", texto)
+        avaliador.assert_not_awaited()
+        self.assertIn("9000", reescritor.await_args.args[2])
+
+    def test_numero_verificado_pode_ser_citado_em_texto_livre(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state[credito.RESULTADO_CREDITO] = {
+            "sucesso": True,
+            "tipo": "consulta_limite",
+            "limite_atual": "8000.00",
+        }
+        contexto.user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text="obrigado!")]
+        )
+        avaliador = AsyncMock(return_value=(True, "ok"))
+
+        with patch(AVALIADOR, avaliador):
+            resposta = asyncio.run(
+                revisar_resposta(
+                    contexto,
+                    _resposta_texto(
+                        "De nada! Seu limite segue em R$ 8.000,00. Algo mais?"
+                    ),
+                )
+            )
+
+        self.assertIsNone(resposta)
+        evidencias = avaliador.await_args.args[0]
+        self.assertEqual(
+            evidencias["fatos_verificados"]["resultado_credito"]["limite_atual"],
+            "8000.00",
         )
 
-        resposta = restringir_resposta_livre(contexto, candidata)
+    def test_falha_do_modelo_usa_resposta_local_de_credito(self):
+        contexto = ContextoCreditoTeste()
+        contexto.state[credito.ETAPA_CREDITO] = credito.AGUARDANDO_NOVO_LIMITE
 
-        self.assertNotIn("aprovado em 9000", resposta.content.parts[0].text)
+        with self.assertLogs("agentes.compartilhado.guardrail", level="ERROR"):
+            resposta = agente_credito.on_model_error_callback(
+                contexto, LlmRequest(), error=RuntimeError("indisponível")
+            )
+
         self.assertIn("novo limite total", resposta.content.parts[0].text)
 
     def test_agente_expoe_somente_ferramentas_deterministicas(self):
@@ -1084,7 +1358,7 @@ class FluxoCreditoTest(unittest.TestCase):
                     )
                 )
                 with patch(
-                    "agentes.triagem.guardrail._avaliar_resposta_com_modelo",
+                    AVALIADOR,
                     new=AsyncMock(return_value=(True, "Resposta segura.")),
                 ):
                     eventos_retorno = list(

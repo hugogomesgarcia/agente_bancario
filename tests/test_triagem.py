@@ -13,14 +13,10 @@ from agentes.triagem.agent import (
     AGUARDANDO_DATA_NASCIMENTO,
     ATENDIMENTO_ENCERRADO,
     ETAPA_AUTENTICACAO,
+    agente_triagem,
     encerrar_apos_limite_de_tentativas,
     interceptar_autenticacao_local,
-)
-from agentes.triagem.guardrail import (
-    CONTEXTO_GUARDRAIL,
-    POS_AUTENTICACAO,
-    aplicar_guardrail_de_resposta,
-    tratar_erro_do_modelo,
+    revisar_resposta,
 )
 from agentes.credito.tools.credito import AGUARDANDO_PROXIMA_ACAO, ETAPA_CREDITO
 from agentes.agent import root_agent
@@ -30,11 +26,22 @@ from agentes.compartilhado.encerramento import (
 from agentes.triagem.tools import consultar_client
 
 
+AVALIADOR = "agentes.compartilhado.guardrail._avaliar_resposta_com_modelo"
+REESCRITOR = "agentes.compartilhado.guardrail._reescrever_resposta_com_modelo"
+
+
 class ContextoDeTeste:
     def __init__(self):
         self.state = {}
         self.user_content = None
+        self.session = SimpleNamespace(events=[])
         self.actions = SimpleNamespace(escalate=False, skip_summarization=False)
+
+
+def _resposta_texto(texto):
+    return LlmResponse(
+        content=types.Content(role="model", parts=[types.Part.from_text(text=texto)])
+    )
 
 
 class FerramentasTriagemTest(unittest.TestCase):
@@ -278,7 +285,7 @@ class FerramentasTriagemTest(unittest.TestCase):
             self.contexto, self._requisicao("quero cancelar meu cartão")
         )
 
-        self.assertIn("informe seu CPF", resposta.content.parts[0].text)
+        self.assertIsNone(resposta)
         self.assertNotIn(AGUARDANDO_CONFIRMACAO_ENCERRAMENTO, self.contexto.state)
 
     def test_atendimento_encerrado_nao_reabre(self):
@@ -291,19 +298,99 @@ class FerramentasTriagemTest(unittest.TestCase):
         self.assertIn("já foi encerrado", resposta.content.parts[0].text)
         self.assertNotIn("cpf_em_validacao", self.contexto.state)
 
-    def test_entrada_sem_cpf_recebe_lembrete_local_sem_contar_tentativa(self):
+    def test_mensagem_livre_antes_da_autenticacao_vai_ao_modelo_sem_ferramentas(self):
         interceptar_autenticacao_local(self.contexto, self._requisicao("oi"))
+        for etapa, mensagem in (
+            (AGUARDANDO_CPF, "oi, tudo bem? o que vocês fazem?"),
+            (AGUARDANDO_DATA_NASCIMENTO, "por que precisam da minha data?"),
+        ):
+            with self.subTest(etapa=etapa):
+                if etapa == AGUARDANDO_DATA_NASCIMENTO:
+                    interceptar_autenticacao_local(
+                        self.contexto, self._requisicao("710.483.880-50")
+                    )
+                requisicao = self._requisicao(mensagem)
+                requisicao.config.tools = [types.Tool()]
+                requisicao.tools_dict["transfer_to_agent"] = object()
+
+                resposta = interceptar_autenticacao_local(self.contexto, requisicao)
+
+                self.assertIsNone(resposta)
+                self.assertFalse(requisicao.config.tools)
+                self.assertEqual(requisicao.tools_dict, {})
+                self.assertIn(
+                    "Não peça CPF, data de nascimento",
+                    requisicao.config.system_instruction,
+                )
+                self.assertEqual(self.contexto.state[ETAPA_AUTENTICACAO], etapa)
+                self.assertNotIn("tentativas_falhas", self.contexto.state)
+                self.assertNotIn("cliente_autenticado", self.contexto.state)
+
+    def test_data_por_extenso_nao_reconhecida_pede_numeros_sem_falha(self):
+        interceptar_autenticacao_local(self.contexto, self._requisicao("oi"))
+        interceptar_autenticacao_local(self.contexto, self._requisicao("710.483.880-50"))
 
         resposta = interceptar_autenticacao_local(
-            self.contexto, self._requisicao("meu telefone é 11999999999")
+            self.contexto,
+            self._requisicao(
+                "Nasci em vinte e nove de julho de mil novecentos e noventa e sete."
+            ),
         )
+
+        self.assertIn("com números, por exemplo 29/07/1997", resposta.content.parts[0].text)
+        self.assertEqual(
+            self.contexto.state[ETAPA_AUTENTICACAO], AGUARDANDO_DATA_NASCIMENTO
+        )
+        self.assertNotIn("tentativas_falhas", self.contexto.state)
+
+    def test_resposta_livre_antes_da_autenticacao_recebe_pedido_do_campo(self):
+        self.contexto.state[ETAPA_AUTENTICACAO] = AGUARDANDO_CPF
+        self.contexto.user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text="oi, tudo bem?")]
+        )
+
+        with patch(AVALIADOR, new=AsyncMock(return_value=(True, "ok"))):
+            resposta = asyncio.run(
+                revisar_resposta(self.contexto, _resposta_texto("Tudo ótimo, obrigado!"))
+            )
 
         self.assertEqual(
             resposta.content.parts[0].text,
-            "Olá! Para continuarmos, informe seu CPF.",
+            "Tudo ótimo, obrigado! Para continuarmos, informe seu CPF.",
         )
-        self.assertEqual(self.contexto.state[ETAPA_AUTENTICACAO], AGUARDANDO_CPF)
-        self.assertNotIn("tentativas_falhas", self.contexto.state)
+
+        self.contexto.state[ETAPA_AUTENTICACAO] = AGUARDANDO_DATA_NASCIMENTO
+        with patch(AVALIADOR, new=AsyncMock(side_effect=RuntimeError("falha"))), \
+                self.assertLogs("agentes.compartilhado.guardrail", level="ERROR"):
+            resposta = asyncio.run(
+                revisar_resposta(self.contexto, _resposta_texto("Claro!"))
+            )
+        self.assertEqual(
+            resposta.content.parts[0].text,
+            "Para continuarmos, informe sua data de nascimento.",
+        )
+
+    def test_chamada_de_ferramenta_antes_da_autenticacao_e_descartada(self):
+        self.contexto.state[ETAPA_AUTENTICACAO] = AGUARDANDO_CPF
+        chamada = LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="transfer_to_agent", args={"agent_name": "credito"}
+                        )
+                    )
+                ],
+            )
+        )
+
+        resposta = asyncio.run(revisar_resposta(self.contexto, chamada))
+
+        self.assertEqual(
+            resposta.content.parts[0].text, "Olá! Para continuarmos, informe seu CPF."
+        )
+        self.assertIsNone(getattr(self.contexto.actions, "transfer_to_agent", None))
 
     def test_solicitacao_autenticada_livre_e_enviada_ao_modelo(self):
         self.contexto.state["cliente_autenticado"] = True
@@ -313,9 +400,10 @@ class FerramentasTriagemTest(unittest.TestCase):
 
         self.assertIsNone(resposta)
         self.assertIsNone(getattr(self.contexto.actions, "transfer_to_agent", None))
-        self.assertEqual(
-            self.contexto.state[CONTEXTO_GUARDRAIL], POS_AUTENTICACAO
-        )
+        instrucoes = requisicao.config.system_instruction
+        self.assertIn("quanto vale meu", instrucoes)
+        self.assertIn("transfira para cambio", instrucoes)
+        self.assertIn("cumprimentos", instrucoes)
 
     def test_valor_isolado_apos_credito_retorna_ao_especialista(self):
         self.contexto.state.update(
@@ -332,24 +420,78 @@ class FerramentasTriagemTest(unittest.TestCase):
         self.assertEqual(resposta.content.parts[0].text, "")
         self.assertEqual(self.contexto.actions.transfer_to_agent, "credito")
 
-    def test_guardrail_devolve_resposta_insegura_para_reescrita(self):
+    def test_pedido_junto_da_credencial_e_retomado_apos_autenticacao(self):
+        interceptar_autenticacao_local(self.contexto, self._requisicao("oi"))
+        interceptar_autenticacao_local(
+            self.contexto,
+            self._requisicao(
+                "Boa tarde! Meu CPF é 710.483.880-50. Quero consultar meu score."
+            ),
+        )
+        self.assertTrue(self.contexto.state["pedido_antes_da_autenticacao"])
+
+        requisicao = self._requisicao("29/07/1997")
+        resposta = interceptar_autenticacao_local(self.contexto, requisicao)
+
+        self.assertIsNone(resposta)
+        self.assertTrue(self.contexto.state["cliente_autenticado"])
+        self.assertIsNone(self.contexto.state["pedido_antes_da_autenticacao"])
+        self.assertIn("pedido pendente no histórico", requisicao.config.system_instruction)
+        self.assertIn("transfira para credito", requisicao.config.system_instruction)
+
+        with self.assertLogs("agentes.compartilhado.guardrail", level="ERROR"):
+            falha = agente_triagem.on_model_error_callback(
+                self.contexto, requisicao, error=RuntimeError("503")
+            )
+        self.assertEqual(
+            falha.content.parts[0].text,
+            "Autenticação realizada com sucesso! Como posso ajudar você hoje?",
+        )
+
+        interceptar_autenticacao_local(self.contexto, self._requisicao("obrigado"))
+        self.assertIsNone(self.contexto.state["autenticacao_recem_concluida"])
+
+    def test_credenciais_sem_pedido_mantem_confirmacao_local(self):
+        interceptar_autenticacao_local(self.contexto, self._requisicao("oi"))
+        for mensagem in (
+            "bom dia, tudo certo?",
+            "oi, tudo bem?",
+            "Fala aí, meu CPF é 710.483.880-50.",
+            "Nasci em 29/07/1997, mano.",
+        ):
+            resposta = interceptar_autenticacao_local(
+                self.contexto, self._requisicao(mensagem)
+            )
+
+        self.assertEqual(
+            resposta.content.parts[0].text,
+            "Autenticação realizada com sucesso! Como posso ajudar você hoje?",
+        )
+        self.assertNotIn("pedido_antes_da_autenticacao", self.contexto.state)
+
+    def test_valor_isolado_com_entrevista_pausada_retorna_a_entrevista(self):
         self.contexto.state.update(
             {
-                CONTEXTO_GUARDRAIL: POS_AUTENTICACAO,
+                "cliente_autenticado": True,
+                ETAPA_CREDITO: AGUARDANDO_PROXIMA_ACAO,
+                "etapa_entrevista_credito": "aguardando_renda_mensal",
             }
         )
-        candidata = LlmResponse(
-            content=types.Content(
-                role="model",
-                parts=[
-                    types.Part.from_text(
-                        text=(
-                            "Informe o valor desejado e sua renda mensal para eu "
-                            "processar o aumento de limite."
-                        )
-                    )
-                ],
-            )
+
+        resposta = interceptar_autenticacao_local(
+            self.contexto, self._requisicao("8000")
+        )
+
+        self.assertEqual(resposta.content.parts[0].text, "")
+        self.assertEqual(
+            self.contexto.actions.transfer_to_agent, "entrevista_credito"
+        )
+
+    def test_guardrail_devolve_resposta_insegura_para_reescrita(self):
+        self.contexto.state["cliente_autenticado"] = True
+        candidata = _resposta_texto(
+            "Informe o valor desejado e sua renda mensal para eu processar o "
+            "aumento de limite."
         )
 
         avaliador = AsyncMock(
@@ -359,122 +501,58 @@ class FerramentasTriagemTest(unittest.TestCase):
             ]
         )
         reescritor = AsyncMock(
-            return_value=(
-                "Entendo seu pedido, mas o atendimento de crédito ainda não "
-                "está disponível."
-            )
+            return_value="Posso direcionar seu pedido ao atendimento de crédito."
         )
-        with patch(
-            "agentes.triagem.guardrail._avaliar_resposta_com_modelo", avaliador
-        ), patch(
-            "agentes.triagem.guardrail._reescrever_resposta_com_modelo", reescritor
-        ):
-            resposta = asyncio.run(
-                aplicar_guardrail_de_resposta(self.contexto, candidata)
-            )
+        with patch(AVALIADOR, avaliador), patch(REESCRITOR, reescritor):
+            resposta = asyncio.run(revisar_resposta(self.contexto, candidata))
 
         texto = resposta.content.parts[0].text.lower()
-        self.assertIn("ainda não está disponível", texto)
-        self.assertNotIn("informe o valor", texto)
+        self.assertIn("atendimento de crédito", texto)
         self.assertNotIn("renda mensal", texto)
         reescritor.assert_awaited_once()
         self.assertEqual(avaliador.await_count, 2)
 
-    def test_guardrail_nao_infere_transferencia_nao_executada(self):
-        mensagens = (
-            "quero aumentar meu limite para 8000",
-            "quero melhorar meu score",
-        )
-        for mensagem in mensagens:
-            with self.subTest(mensagem=mensagem):
-                self.contexto = ContextoDeTeste()
-                self.contexto.state.update(
-                    {
-                        "cliente_autenticado": True,
-                        CONTEXTO_GUARDRAIL: POS_AUTENTICACAO,
-                    }
-                )
-                self.contexto.user_content = types.Content(
-                    role="user", parts=[types.Part.from_text(text=mensagem)]
-                )
-                candidata = LlmResponse(
-                    content=types.Content(
-                        role="model",
-                        parts=[types.Part.from_text(text="Vou verificar para você.")],
-                    )
-                )
-
-                with patch(
-                    "agentes.triagem.guardrail._avaliar_resposta_com_modelo",
-                    new=AsyncMock(
-                        return_value=(False, "A transferência não foi executada.")
-                    ),
-                ), patch(
-                    "agentes.triagem.guardrail._reescrever_resposta_com_modelo",
-                    new=AsyncMock(return_value="Não posso realizar essa operação."),
-                ):
-                    resposta = asyncio.run(
-                        aplicar_guardrail_de_resposta(self.contexto, candidata)
-                    )
-
-                self.assertIn("Não tenho uma fonte", resposta.content.parts[0].text)
-                self.assertIsNone(
-                    getattr(self.contexto.actions, "transfer_to_agent", None)
-                )
-
-    def test_guardrail_libera_resposta_aprovada_sem_altera_la(self):
-        self.contexto.state[CONTEXTO_GUARDRAIL] = POS_AUTENTICACAO
-        candidata = LlmResponse(
-            content=types.Content(
-                role="model",
-                parts=[types.Part.from_text(text="Entendo sua solicitação.")],
-            )
+    def test_guardrail_bloqueia_apos_segunda_reprovacao(self):
+        self.contexto.state["cliente_autenticado"] = True
+        self.contexto.user_content = types.Content(
+            role="user", parts=[types.Part.from_text(text="quero melhorar meu score")]
         )
 
         with patch(
-            "agentes.triagem.guardrail._avaliar_resposta_com_modelo",
-            new=AsyncMock(return_value=(True, "Resposta segura.")),
-        ):
+            AVALIADOR,
+            new=AsyncMock(return_value=(False, "A transferência não foi executada.")),
+        ), patch(REESCRITOR, new=AsyncMock(return_value="Vou verificar.")):
             resposta = asyncio.run(
-                aplicar_guardrail_de_resposta(self.contexto, candidata)
+                revisar_resposta(self.contexto, _resposta_texto("Vou verificar para você."))
+            )
+
+        texto = resposta.content.parts[0].text
+        self.assertIn("não consegui responder isso com segurança", texto)
+        self.assertIn("cotações de moedas", texto)
+        self.assertIsNone(getattr(self.contexto.actions, "transfer_to_agent", None))
+
+    def test_guardrail_libera_resposta_aprovada_sem_altera_la(self):
+        self.contexto.state["cliente_autenticado"] = True
+
+        with patch(AVALIADOR, new=AsyncMock(return_value=(True, "Resposta segura."))):
+            resposta = asyncio.run(
+                revisar_resposta(self.contexto, _resposta_texto("De nada! Até logo."))
             )
 
         self.assertIsNone(resposta)
 
-    def test_guardrail_falha_fechado_se_revisor_ficar_indisponivel(self):
-        self.contexto.state[CONTEXTO_GUARDRAIL] = POS_AUTENTICACAO
-        candidata = LlmResponse(
-            content=types.Content(
-                role="model",
-                parts=[types.Part.from_text(text="Resposta não verificada.")],
-            )
-        )
-
-        with patch(
-            "agentes.triagem.guardrail._avaliar_resposta_com_modelo",
-            new=AsyncMock(side_effect=RuntimeError("indisponível")),
-        ), self.assertLogs("agentes.triagem.guardrail", level="ERROR"):
-            resposta = asyncio.run(
-                aplicar_guardrail_de_resposta(self.contexto, candidata)
-            )
-
-        self.assertIn(
-            "Não tenho uma fonte ou ferramenta disponível",
-            resposta.content.parts[0].text,
-        )
-
     def test_falha_do_modelo_principal_retorna_resposta_segura(self):
-        self.contexto.state[CONTEXTO_GUARDRAIL] = POS_AUTENTICACAO
+        self.contexto.state["cliente_autenticado"] = True
 
-        with self.assertLogs("agentes.triagem.guardrail", level="ERROR"):
-            resposta = tratar_erro_do_modelo(
+        with self.assertLogs("agentes.compartilhado.guardrail", level="ERROR"):
+            resposta = agente_triagem.on_model_error_callback(
                 self.contexto,
                 self._requisicao("quero aumentar meu limite"),
                 error=RuntimeError("indisponível"),
             )
 
         self.assertIn(
-            "Não tenho uma fonte ou ferramenta disponível",
+            "não consegui responder isso com segurança",
             resposta.content.parts[0].text,
         )
 
@@ -524,6 +602,11 @@ class FerramentasTriagemTest(unittest.TestCase):
         )
         for subagente in root_agent.sub_agents:
             self.assertIs(subagente.parent_agent, root_agent)
+        for agente in (root_agent, *root_agent.sub_agents):
+            opcoes_http = agente.generate_content_config.http_options
+            self.assertEqual(opcoes_http.timeout, 20_000)
+            self.assertEqual(opcoes_http.retry_options.attempts, 4)
+            self.assertEqual(agente.mode, "chat")
 
 
 if __name__ == "__main__":

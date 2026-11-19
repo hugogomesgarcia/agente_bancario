@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from decimal import Decimal
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from agentes.cambio.agent import (
     interceptar_fluxo_cambio,
 )
 from agentes.cambio.tools import cambio
+from agentes.credito.tools.credito import BaseCreditoIndisponivel
 from agentes.compartilhado.encerramento import solicitar_confirmacao_encerramento
 from agentes.compartilhado.estado import OPCOES_RESPOSTA
 from agentes.triagem.agent import agente_triagem
@@ -43,7 +45,9 @@ class ContextoCambioTeste:
     def __init__(self, *, autenticado=True):
         self.state = {}
         if autenticado:
-            self.state["cliente_autenticado"] = True
+            self.state.update(
+                {"cliente_autenticado": True, "cpf_cliente": "71048388050"}
+            )
         self.user_content = None
         self.actions = SimpleNamespace(
             escalate=False,
@@ -327,6 +331,114 @@ class CambioTest(unittest.TestCase):
             resultado = cambio._buscar_par("USD", "BRL")
         self.assertEqual(resultado["erro"], "resposta_api_invalida")
 
+    def _cotacao_brl_gbp(self):
+        return {
+            "sucesso": True,
+            "ativo_base": "BRL",
+            "ativo_destino": "GBP",
+            "nome_par": "BRL/GBP",
+            "compra": "0.1400",
+            "venda": "0.1450",
+            "consultado_em": "19/11/2026 às 12:00 UTC",
+            "fonte": "AwesomeAPI",
+            "derivada_par_inverso": True,
+            "derivada_par_cruzado": False,
+        }
+
+    def _converter_limite(self, contexto, **alteracoes):
+        argumentos = {
+            "status": "resolvido",
+            "ativo_base": "BRL",
+            "ativo_destino": "GBP",
+            "destino_explicito": True,
+            "evidencia_base": "meu limite",
+            "evidencia_destino": "em libras",
+            "evidencia_quantidade": "meu limite",
+            "usar_limite_credito": True,
+            "tool_context": contexto,
+            **alteracoes,
+        }
+        return cambio.processar_solicitacao_cambio(**argumentos)
+
+    def test_conversao_do_limite_usa_valor_lido_da_base_de_credito(self):
+        contexto = ContextoCambioTeste()
+        with patch.object(
+            cambio, "ler_limite_atual", return_value=Decimal("8000.00")
+        ) as ler, patch.object(
+            cambio, "_consultar_cotacao", return_value=self._cotacao_brl_gbp()
+        ):
+            resultado = self._converter_limite(contexto)
+
+        ler.assert_called_once_with("71048388050")
+        self.assertTrue(resultado["sucesso"])
+        self.assertEqual(resultado["origem_quantidade"], "limite_credito")
+        self.assertEqual(resultado["quantidade_base"], "8000")
+        self.assertEqual(resultado["total_compra"], "1120")
+        self.assertEqual(resultado["total_venda"], "1160")
+
+    def test_conversao_do_limite_valida_contrato_antes_da_api(self):
+        casos = (
+            ({"ativo_base": "USD"}, "limite_credito_exige_brl"),
+            ({"quantidade_base": 5000}, "quantidade_invalida"),
+            ({"evidencia_quantidade": None}, "quantidade_invalida"),
+        )
+        for alteracoes, erro in casos:
+            with self.subTest(alteracoes=alteracoes):
+                contexto = ContextoCambioTeste()
+                with patch.object(cambio, "ler_limite_atual") as ler, patch.object(
+                    cambio, "_consultar_cotacao"
+                ) as consultar:
+                    resultado = self._converter_limite(contexto, **alteracoes)
+
+                self.assertEqual(resultado["erro"], erro)
+                ler.assert_not_called()
+                consultar.assert_not_called()
+
+    def test_conversao_do_limite_falha_sem_base_ou_autenticacao(self):
+        for contexto, efeito in (
+            (ContextoCambioTeste(), BaseCreditoIndisponivel()),
+            (ContextoCambioTeste(autenticado=False), None),
+        ):
+            with self.subTest(autenticado=contexto.state.get("cliente_autenticado")):
+                with patch.object(
+                    cambio, "ler_limite_atual", side_effect=efeito
+                ), patch.object(cambio, "_consultar_cotacao") as consultar:
+                    resultado = self._converter_limite(contexto)
+
+                self.assertEqual(resultado["erro"], "limite_credito_indisponivel")
+                consultar.assert_not_called()
+
+    def test_callback_identifica_conversao_do_limite(self):
+        contexto = ContextoCambioTeste()
+        resultado = {
+            **self._cotacao_brl_gbp(),
+            "origem_quantidade": "limite_credito",
+            "quantidade_base": "8000",
+            "total_compra": "1120",
+            "total_venda": "1160",
+        }
+        contexto.state[cambio.RESULTADO_CAMBIO] = resultado
+
+        resposta = interceptar_fluxo_cambio(
+            contexto, self._requisicao(contexto, "mensagem", retorno=resultado)
+        )
+
+        texto = resposta.content.parts[0].text
+        self.assertIn(
+            "Para o seu limite de crédito atual de 8.000 BRL, o valor "
+            "correspondente é GBP 1.120",
+            texto,
+        )
+
+    def test_violacao_do_contrato_do_limite_permite_uma_nova_tentativa(self):
+        contexto = ContextoCambioTeste()
+        resultado = {"sucesso": False, "erro": "limite_credito_exige_brl"}
+        contexto.state[cambio.RESULTADO_CAMBIO] = resultado
+        requisicao = self._requisicao(contexto, "mensagem", retorno=resultado)
+
+        self.assertIsNone(interceptar_fluxo_cambio(contexto, requisicao))
+        self.assertIn("usar_limite_credito true", requisicao.config.system_instruction)
+
     def test_callback_formata_somente_resultado_da_ferramenta(self):
         contexto = ContextoCambioTeste()
         resultado = {
@@ -519,6 +631,7 @@ class CambioTest(unittest.TestCase):
         )
         self.assertIn("moeda da China em euro", agente_cambio.instruction)
         self.assertIn("quantidade_base 10000", agente_cambio.instruction)
+        self.assertIn("quanto vale meu limite em libras", agente_cambio.instruction)
 
     def test_runner_transfere_e_preserva_par_interpretado_pelo_modelo(self):
         modelo = ModeloCambioTeste(model="modelo-cambio-teste")

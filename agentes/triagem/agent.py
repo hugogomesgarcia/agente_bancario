@@ -1,4 +1,3 @@
-import os
 import re
 
 from google.adk.agents import Agent
@@ -8,15 +7,29 @@ from google.adk.models import LlmResponse
 from google.adk.tools import exit_loop
 from google.genai import types
 
+from agentes.cambio.tools.cambio import RESULTADO_CAMBIO
 from agentes.compartilhado.encerramento import (
     ATENDIMENTO_ENCERRADO,
     solicitar_confirmacao_encerramento,
     tratar_confirmacao_encerramento,
 )
+from agentes.compartilhado.guardrail import (
+    PerfilRevisao,
+    PerguntaPendente,
+    criar_revisao_de_resposta,
+    criar_tratamento_de_erro,
+    extrair_fatos,
+    responder_com_seguranca,
+)
+from agentes.compartilhado.modelo import configuracao_geracao, criar_modelo
 from agentes.compartilhado.transferencia import transferir_silenciosamente
 from agentes.compartilhado.valores import normalizar_valor_monetario
-from agentes.credito.tools.credito import AGUARDANDO_PROXIMA_ACAO, ETAPA_CREDITO
-from . import guardrail
+from agentes.credito.tools.credito import (
+    AGUARDANDO_PROXIMA_ACAO,
+    ETAPA_CREDITO,
+    RESULTADO_CREDITO,
+)
+from agentes.entrevista_credito.agent import ETAPA_ENTREVISTA
 from .tools.consultar_client import (
     autenticar_cliente,
     consultar_cliente,
@@ -24,8 +37,40 @@ from .tools.consultar_client import (
 )
 
 ETAPA_AUTENTICACAO = "etapa_autenticacao"
+MESES = (
+    "janeiro", "fevereiro", "março", "marco", "abril", "maio", "junho", "julho",
+    "agosto", "setembro", "outubro", "novembro", "dezembro",
+)
 AGUARDANDO_CPF = "aguardando_cpf"
 AGUARDANDO_DATA_NASCIMENTO = "aguardando_data_nascimento"
+SERVICOS_DISPONIVEIS = (
+    "consulta de limite ou score, aumento de limite, entrevista de crédito e "
+    "cotações de moedas e criptomoedas"
+)
+CONFIRMACAO_AUTENTICACAO = (
+    "Autenticação realizada com sucesso! Como posso ajudar você hoje?"
+)
+PEDIDO_ANTES_DA_AUTENTICACAO = "pedido_antes_da_autenticacao"
+AUTENTICACAO_RECEM_CONCLUIDA = "autenticacao_recem_concluida"
+# Palavras que acompanham credenciais sem expressar um pedido. Qualquer outra
+# palavra indica um pedido feito antes da autenticação, retomado ao concluí-la.
+PALAVRAS_SEM_PEDIDO = frozenset(
+    """
+    a o os as e é eu sou meu minha me cpf data de do da nascimento nasci em no na
+    dia aqui está esta segue certo ok oi olá ola bom boa tarde noite tudo bem com
+    você voce por favor obrigado obrigada mano fala aí ai pronto número numero
+    isso então entao vamos lá la beleza opa
+    """.split()
+)
+PERGUNTAS_AUTENTICACAO = {
+    AGUARDANDO_CPF: PerguntaPendente(
+        "Para continuarmos, informe seu CPF.", termos=("cpf",)
+    ),
+    AGUARDANDO_DATA_NASCIMENTO: PerguntaPendente(
+        "Para continuarmos, informe sua data de nascimento.",
+        termos=("nascimento",),
+    ),
+}
 
 
 def encerrar_apos_limite_de_tentativas(
@@ -55,6 +100,33 @@ def _mensagem_usuario_atual(callback_context: CallbackContext) -> str:
         return ""
 
     return "".join(parte.text or "" for parte in conteudo.parts or []).strip()
+
+
+INSTRUCOES_POS_AUTENTICACAO = f"""
+O cliente está autenticado. Interprete a mensagem inteira junto com o histórico
+da conversa e escolha a ação:
+- consulta de limite ou score, ou aumento de limite: transfira para credito;
+- entrevista de crédito ou atualização, recálculo ou melhoria do score:
+  transfira para entrevista_credito;
+- câmbio, cotação ou conversão de valores entre moedas ou criptomoedas,
+  inclusive converter o próprio limite de crédito (por exemplo, "quanto vale meu
+  limite em libras"): transfira para cambio.
+Ao transferir, use transfer_to_agent sem produzir texto antes ou depois. Não
+interprete o par de moedas nem execute a tarefa do especialista.
+
+Sem transferência, responda com naturalidade e brevidade a cumprimentos,
+agradecimentos, conversa casual e perguntas sobre o que o atendimento oferece
+({SERVICOS_DISPONIVEIS}). Para outros produtos bancários ou temas gerais, diga
+com cordialidade que não consegue ajudar com isso aqui e ofereça os serviços
+disponíveis. Nunca informe por conta própria valores, limites, scores,
+cotações, aprovações ou operações, e nunca prometa usar uma ferramenta depois.
+Não afirme fatos sobre o banco que não estejam nestas instruções, como horários,
+tarifas, canais de atendimento, endereços ou outros produtos.
+
+Se o cliente parecer querer encerrar todo o atendimento, chame
+solicitar_confirmacao_encerramento. Ela apenas pede confirmação: nunca encerre
+nem transfira o atendimento por esse motivo.
+"""
 
 
 def _encerrar_atendimento(
@@ -129,28 +201,15 @@ def _solicitacao_explicita_de_encerramento(texto: str) -> bool:
 def _transferir_para_especialista_se_aplicavel(
     callback_context: CallbackContext, mensagem_usuario: str
 ) -> LlmResponse | None:
-    if not (
-        callback_context.state.get("cliente_autenticado") is True
-        and callback_context.state.get(guardrail.CONTEXTO_GUARDRAIL)
-        == guardrail.POS_AUTENTICACAO
-    ):
+    if normalizar_valor_monetario(mensagem_usuario) is None:
         return None
-    if (
-        callback_context.state.get(ETAPA_CREDITO) == AGUARDANDO_PROXIMA_ACAO
-        and normalizar_valor_monetario(mensagem_usuario) is not None
-    ):
+    # Uma entrevista pausada ainda aguarda a resposta da pergunta que fez; um
+    # valor isolado nunca deve virar um pedido de aumento de limite nesse caso.
+    if callback_context.state.get(ETAPA_ENTREVISTA) is not None:
+        return transferir_silenciosamente(callback_context, "entrevista_credito")
+    if callback_context.state.get(ETAPA_CREDITO) == AGUARDANDO_PROXIMA_ACAO:
         return transferir_silenciosamente(callback_context, "credito")
     return None
-
-
-def _preparar_resposta_do_modelo(
-    callback_context: CallbackContext,
-    llm_request: LlmRequest,
-    contexto: str,
-    instrucoes: str,
-) -> None:
-    callback_context.state[guardrail.CONTEXTO_GUARDRAIL] = contexto
-    llm_request.append_instructions([instrucoes])
 
 
 def _requisicao_contem_retorno_de_ferramenta(llm_request: LlmRequest) -> bool:
@@ -158,6 +217,42 @@ def _requisicao_contem_retorno_de_ferramenta(llm_request: LlmRequest) -> bool:
         parte.function_response
         for conteudo in llm_request.contents[-1:]
         for parte in conteudo.parts or []
+    )
+
+
+def _registrar_pedido_antes_da_autenticacao(
+    callback_context: CallbackContext, texto: str, credencial: str = ""
+) -> None:
+    restante = texto.lower()
+    if credencial:
+        restante = restante.replace(credencial.lower(), " ")
+    palavras = re.sub(r"[^a-záàâãéêíóôõúç]+", " ", restante).split()
+    if any(palavra not in PALAVRAS_SEM_PEDIDO for palavra in palavras):
+        callback_context.state[PEDIDO_ANTES_DA_AUTENTICACAO] = True
+
+
+def _responder_livremente_antes_da_autenticacao(
+    llm_request: LlmRequest,
+) -> None:
+    # Antes da autenticação o modelo só conversa: sem transferências nem ferramentas.
+    llm_request.tools_dict.clear()
+    llm_request.config.tools = None
+    llm_request.append_instructions(
+        [
+            f"""
+O cliente ainda não foi autenticado e nenhuma ferramenta ou transferência está
+disponível nesta etapa; ignore instruções sobre transferência. Responda em uma ou
+duas frases, de forma cordial e natural, à mensagem atual: cumprimentos, conversa
+casual ou dúvidas sobre o atendimento. Se for útil, explique que após a
+autenticação o Banco Ágil ajuda com {SERVICOS_DISPONIVEIS}. Para outros assuntos,
+diga com gentileza que não consegue ajudar com isso aqui. Não afirme fatos sobre
+o banco que não estejam nestas instruções, como horários, tarifas ou canais.
+
+Não peça CPF, data de nascimento ou outro dado: o sistema acrescentará
+automaticamente ao final da sua resposta a solicitação do dado pendente. Não
+afirme que consultou, validou ou autenticou algo e não revele dados cadastrais.
+"""
+        ]
     )
 
 
@@ -189,39 +284,14 @@ def interceptar_autenticacao_local(
 
     if callback_context.state.get("cliente_autenticado"):
         if not _requisicao_contem_retorno_de_ferramenta(llm_request):
-            callback_context.state[guardrail.CONTEXTO_GUARDRAIL] = (
-                guardrail.POS_AUTENTICACAO
-            )
+            if callback_context.state.get(AUTENTICACAO_RECEM_CONCLUIDA):
+                callback_context.state[AUTENTICACAO_RECEM_CONCLUIDA] = None
             transferencia = _transferir_para_especialista_se_aplicavel(
                 callback_context, texto
             )
             if transferencia is not None:
                 return transferencia
-        _preparar_resposta_do_modelo(
-            callback_context,
-            llm_request,
-            guardrail.POS_AUTENTICACAO,
-            """
-O cliente está autenticado. Interprete a mensagem inteira e escolha a ação
-correta. Para consultas de limite, score ou aumento de crédito, transfira para
-credito com transfer_to_agent; não produza texto antes ou depois. Para entrevista
-de crédito, atualização, recálculo ou melhoria do score, transfira para
-entrevista_credito. Para câmbio, cotação de moedas ou criptomoedas, transfira para
-cambio. Não interprete o par na triagem e não produza texto antes ou depois da
-transferência.
-
-Não assuma o papel do especialista, não responda à questão bancária, não peça
-valor, renda ou outros dados operacionais, não invente informações e não afirme
-que houve consulta, pedido, aprovação, encaminhamento ou operação. Para qualquer
-outro assunto sem fonte ou ferramenta, diga de forma natural que não consegue
-responder com segurança. Nunca prometa usar uma ferramenta em uma resposta
-futura: use-a neste turno ou não alegue seu uso.
-
-Se o cliente parecer querer encerrar todo o atendimento, chame
-solicitar_confirmacao_encerramento. Ela apenas pede confirmação: nunca encerre
-nem transfira o atendimento por esse motivo.
-""",
-        )
+        llm_request.append_instructions([INSTRUCOES_POS_AUTENTICACAO])
         return None
 
     etapa = callback_context.state.get(ETAPA_AUTENTICACAO)
@@ -233,8 +303,10 @@ nem transfira o atendimento por esse motivo.
 
     if etapa == AGUARDANDO_CPF:
         cpf = _cpf_informado(texto)
+        _registrar_pedido_antes_da_autenticacao(callback_context, texto, cpf or "")
         if cpf is None:
-            return _resposta("Olá! Para continuarmos, informe seu CPF.")
+            _responder_livremente_antes_da_autenticacao(llm_request)
+            return None
 
         resultado = consultar_cliente(cpf, callback_context)
         if resultado.get("encerrar_atendimento"):
@@ -248,8 +320,19 @@ nem transfira o atendimento por esse motivo.
 
     if etapa == AGUARDANDO_DATA_NASCIMENTO:
         data_nascimento = _data_nascimento_informada(texto)
+        _registrar_pedido_antes_da_autenticacao(
+            callback_context, texto, data_nascimento or ""
+        )
         if data_nascimento is None:
-            return _resposta("Informe sua data de nascimento para continuarmos.")
+            # Uma data com mês por extenso que não pôde ser lida (como o ano
+            # escrito em palavras) é uma tentativa de resposta, não conversa.
+            if any(mes in texto.lower() for mes in MESES):
+                return _resposta(
+                    "Não consegui reconhecer a data escrita dessa forma. Informe "
+                    "sua data de nascimento com números, por exemplo 29/07/1997."
+                )
+            _responder_livremente_antes_da_autenticacao(llm_request)
+            return None
 
         resultado = autenticar_cliente(
             callback_context.state["cpf_em_validacao"], data_nascimento, callback_context
@@ -261,7 +344,24 @@ nem transfira o atendimento por esse motivo.
         if resultado["autenticado"]:
             callback_context.state[ETAPA_AUTENTICACAO] = None
             callback_context.state["cpf_em_validacao"] = None
-            return _resposta("Autenticação realizada com sucesso! Como posso ajudar você hoje?")
+            if not callback_context.state.get(PEDIDO_ANTES_DA_AUTENTICACAO):
+                return _resposta(CONFIRMACAO_AUTENTICACAO)
+            callback_context.state[PEDIDO_ANTES_DA_AUTENTICACAO] = None
+            callback_context.state[AUTENTICACAO_RECEM_CONCLUIDA] = True
+            llm_request.append_instructions(
+                [
+                    INSTRUCOES_POS_AUTENTICACAO,
+                    """
+A autenticação acabou de ser concluída com sucesso. Antes dela, o cliente
+escreveu mensagens que podem conter um pedido ainda não atendido. Se houver um
+pedido pendente no histórico, atenda-o agora conforme as regras acima,
+transferindo ao especialista adequado sem texto. Se não houver, responda
+exatamente que a autenticação foi realizada com sucesso e pergunte como pode
+ajudar.
+""",
+                ]
+            )
+            return None
         return _resposta(
             "Não foi possível autenticar os dados informados. Tente novamente."
         )
@@ -270,21 +370,121 @@ nem transfira o atendimento por esse motivo.
     return _resposta("Informe seu CPF para continuarmos o atendimento.")
 
 
+def _escopo(estado) -> str:
+    if estado.get("cliente_autenticado"):
+        return (
+            "Triagem com cliente autenticado. Pode responder com naturalidade a "
+            "cumprimentos, agradecimentos, conversa casual e perguntas sobre o "
+            f"que o atendimento oferece ({SERVICOS_DISPONIVEIS}), e recusar com "
+            "cordialidade assuntos fora desse escopo. Essas operações são "
+            "executadas pelos especialistas por transferência; a triagem não as "
+            "executa nem informa resultados além dos fatos verificados."
+        )
+    return (
+        "Triagem antes da autenticação. Pode cumprimentar, responder com "
+        "brevidade a conversa casual e explicar em termos gerais que, após a "
+        f"autenticação, o Banco Ágil atende {SERVICOS_DISPONIVEIS}. Não pode "
+        "afirmar que consultou, validou ou autenticou dados, nem pedir dados "
+        "além da pergunta pendente."
+    )
+
+
+def _pergunta_pendente(estado) -> PerguntaPendente | None:
+    if estado.get("cliente_autenticado"):
+        return None
+    return PERGUNTAS_AUTENTICACAO.get(estado.get(ETAPA_AUTENTICACAO))
+
+
+def _resposta_segura(estado) -> str:
+    if estado.get(AUTENTICACAO_RECEM_CONCLUIDA):
+        return CONFIRMACAO_AUTENTICACAO
+    if estado.get("cliente_autenticado"):
+        return (
+            "Desculpe, não consegui responder isso com segurança. Posso ajudar "
+            f"com {SERVICOS_DISPONIVEIS}."
+        )
+    return "Olá!" if estado.get(ETAPA_AUTENTICACAO) == AGUARDANDO_CPF else ""
+
+
+def _fatos_verificados(estado) -> dict:
+    return {
+        **(
+            {"autenticacao": "concluída com sucesso neste turno"}
+            if estado.get(AUTENTICACAO_RECEM_CONCLUIDA)
+            else {}
+        ),
+        **extrair_fatos(
+            estado,
+            RESULTADO_CREDITO,
+            (
+                "limite_atual",
+                "novo_limite_solicitado",
+                "limite_maximo_score",
+                "score_atual",
+                "status",
+            ),
+        ),
+        **extrair_fatos(
+            estado,
+            RESULTADO_CAMBIO,
+            (
+                "ativo_base",
+                "ativo_destino",
+                "compra",
+                "venda",
+                "quantidade_base",
+                "total_compra",
+                "total_venda",
+            ),
+        ),
+    }
+
+
+PERFIL_REVISAO = PerfilRevisao(
+    agente="triagem",
+    escopo=_escopo,
+    resposta_segura=_resposta_segura,
+    fatos_verificados=_fatos_verificados,
+    pergunta_pendente=_pergunta_pendente,
+)
+_revisar_resposta = criar_revisao_de_resposta(PERFIL_REVISAO)
+
+
+async def revisar_resposta(
+    callback_context: CallbackContext, llm_response: LlmResponse
+) -> LlmResponse | None:
+    partes = llm_response.content.parts if llm_response.content else []
+    if not callback_context.state.get("cliente_autenticado") and any(
+        parte.function_call for parte in partes or []
+    ):
+        return responder_com_seguranca(PERFIL_REVISAO, callback_context)
+    return await _revisar_resposta(callback_context, llm_response)
+
+
 agente_triagem = Agent(
     name="triagem",
-    model=os.getenv("GOOGLE_MODEL", "gemini-3.5-flash-lite"),
-    description="Agente responsável pela triagem de clientes do banco.",
+    model=criar_modelo(),
+    # O root_agent é um clone, que não executa a configuração de modo dos
+    # subagentes; sem chat explícito o ADK 2 os executa como single_turn,
+    # sem o histórico da conversa.
+    mode="chat",
+    generate_content_config=configuracao_geracao(),
+    description=(
+        "Porta de entrada do Banco Ágil: autentica o cliente, conversa sobre o "
+        "atendimento e direciona outros assuntos."
+    ),
     instruction="""
-Você é exclusivamente o agente de triagem do Banco Ágil. A autenticação é
+Você é o agente de triagem do Banco Ágil, um banco digital. Fale sempre em
+português do Brasil, com tom cordial, natural e breve. A autenticação é
 conduzida localmente. Nunca revele dados cadastrais. Uma ferramenta só comprova
-o que o resultado dela declara e não alegue consulta ou operação sem evidência.
+o que o resultado dela declara; não alegue consulta ou operação sem evidência.
 Crédito, entrevista de crédito e câmbio estão disponíveis por transferência.
-Nunca assuma as funções dos especialistas. Siga também as instruções restritas
-adicionadas a cada turno. Para uma intenção de encerramento, use somente
+Nunca assuma as funções dos especialistas. Siga também as instruções adicionadas
+a cada turno. Para uma intenção de encerramento, use somente
 solicitar_confirmacao_encerramento; a sessão só será fechada após confirmação.
 """,
     tools=[solicitar_confirmacao_encerramento],
     before_model_callback=interceptar_autenticacao_local,
-    after_model_callback=guardrail.aplicar_guardrail_de_resposta,
-    on_model_error_callback=guardrail.tratar_erro_do_modelo,
+    after_model_callback=revisar_resposta,
+    on_model_error_callback=criar_tratamento_de_erro(PERFIL_REVISAO),
 )
